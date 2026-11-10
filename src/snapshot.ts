@@ -1,11 +1,34 @@
-import { sql, getTableColumns, is, type Casing, type SQL } from "drizzle-orm";
-import { CasingCache } from "drizzle-orm/casing";
-import { PgTable, type AnyPgColumn } from "drizzle-orm/pg-core";
+import { Column, SQL, sql, getTableColumns, is, type Casing } from "drizzle-orm";
+import { CasingCache, toCamelCase, toSnakeCase } from "drizzle-orm/casing";
+import {
+  CheckBuilder,
+  ForeignKeyBuilder,
+  IndexBuilder,
+  PgArray,
+  PgEnumColumn,
+  PgEnumObjectColumn,
+  PgTable,
+  PrimaryKeyBuilder,
+  UniqueConstraintBuilder,
+  getMaterializedViewConfig,
+  getViewConfig,
+  isPgEnum,
+  isPgMaterializedView,
+  isPgView,
+  type AnyPgColumn,
+  type ForeignKey,
+  type Index,
+  type PgView,
+  type PrimaryKey,
+  type UniqueConstraint,
+} from "drizzle-orm/pg-core";
 import {
   assertColumnOfTable,
   extrasKind,
   readComment,
   tableIdentity,
+  type AnyPgEnum,
+  type PgViewLike,
   type PartitionBound,
   type PartitionedTable,
   type PgComment,
@@ -64,12 +87,28 @@ export type ExtensionSnapshot = {
   cascade: boolean;
 };
 
+export type CommentKind =
+  | "table"
+  | "column"
+  | "enum"
+  | "view"
+  | "materializedView"
+  | "function"
+  | "trigger"
+  | "index"
+  | "constraint"
+  | "extension";
+
 export type CommentSnapshot = {
   id: string;
-  kind: "table" | "column";
+  kind: CommentKind;
   schema: string;
-  table: string;
+  /** Table, column, enum, view, function, trigger, index, constraint, or extension name. */
+  name: string;
+  /** Table or view that owns a column, trigger, or constraint. */
+  relation: string | null;
   column: string | null;
+  argTypes: string[];
   text: string;
 };
 
@@ -77,6 +116,30 @@ export type InventoryTable = {
   schema: string;
   name: string;
   columns: string[];
+};
+
+export type InventoryName = {
+  schema: string;
+  name: string;
+};
+
+export type InventoryView = {
+  schema: string;
+  name: string;
+  materialized: boolean;
+  columns: string[];
+};
+
+export type InventoryIndex = {
+  schema: string;
+  table: string;
+  name: string;
+};
+
+export type InventoryConstraint = {
+  schema: string;
+  table: string;
+  name: string;
 };
 
 export type PartitionedTableSnapshot = {
@@ -120,6 +183,10 @@ export type Snapshot = {
   inventory: {
     scanned: boolean;
     tables: InventoryTable[];
+    enums: InventoryName[];
+    views: InventoryView[];
+    indexes: InventoryIndex[];
+    constraints: InventoryConstraint[];
   };
 };
 
@@ -133,7 +200,7 @@ export function emptySnapshot(): Snapshot {
     partitionedTables: [],
     partitions: [],
     detaches: [],
-    inventory: { scanned: false, tables: [] },
+    inventory: { scanned: false, tables: [], enums: [], views: [], indexes: [], constraints: [] },
   };
 }
 
@@ -155,6 +222,7 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
   }
 
   const triggers: TriggerSnapshot[] = [];
+  const triggerByObject = new Map<PgTrigger, TriggerSnapshot>();
   for (const trigger of extras.triggers) {
     const owned = ownedUpdatedAt(trigger, nameOf);
     if (owned) {
@@ -166,7 +234,9 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
         );
       }
     }
-    triggers.push(snapshotTrigger(trigger, casing, nameOf, fnByObject, owned));
+    const snap = snapshotTrigger(trigger, casing, nameOf, fnByObject, owned);
+    triggers.push(snap);
+    triggerByObject.set(trigger, snap);
   }
 
   const extensions: ExtensionSnapshot[] = [];
@@ -184,12 +254,43 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
   }
 
   const comments: CommentSnapshot[] = [];
+  const inventoryIndexes: InventoryIndex[] = [];
+  const inventoryConstraints: InventoryConstraint[] = [];
   for (const table of extras.tables) {
     const harvested = harvest(table, nameOf);
     if (harvested.table) pushComment(comments, harvested.table);
     for (const column of harvested.columns) pushComment(comments, column);
+    const relations = harvestRelations(table, nameOf, casing);
+    for (const comment of relations.comments) pushComment(comments, comment);
+    inventoryIndexes.push(...relations.indexes);
+    inventoryConstraints.push(...relations.constraints);
   }
-  for (const comment of extras.comments) pushComment(comments, snapshotComment(comment, nameOf));
+  for (const fn of extras.functions) {
+    const text = readComment(fn);
+    const snap = fnByObject.get(fn);
+    if (text && snap) pushComment(comments, functionComment(snap, text));
+  }
+  for (const trigger of extras.triggers) {
+    const text = readComment(trigger);
+    const snap = triggerByObject.get(trigger);
+    if (text && snap) pushComment(comments, triggerComment(snap, text));
+  }
+  for (const ext of extras.extensions) {
+    const text = readComment(ext);
+    if (text) pushComment(comments, extensionComment(ext.name, text));
+  }
+  const enumObjects = enumObjectsIn(extras);
+  for (const enumObject of enumObjects) {
+    const text = readComment(enumObject as object);
+    if (!text) continue;
+    pushComment(comments, enumComment(enumIdentity(enumObject), text));
+  }
+  for (const view of extras.views) {
+    for (const comment of harvestView(view, nameOf)) pushComment(comments, comment);
+  }
+  for (const comment of extras.comments) {
+    pushComment(comments, snapshotComment(comment, nameOf, casing, fnByObject, triggerByObject, extras));
+  }
 
   const inventoryTables: InventoryTable[] = extras.tables.map((table) => {
     const identity = tableIdentity(table);
@@ -202,6 +303,19 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
     };
   });
   inventoryTables.sort((a, b) => `${a.schema}.${a.name}`.localeCompare(`${b.schema}.${b.name}`));
+  const inventoryEnums = uniqueNames(enumObjects.map((enumObject) => enumIdentity(enumObject)));
+  const inventoryViews = extras.views.map((view) => {
+    const identity = viewIdentity(view);
+    return {
+      schema: identity.schema,
+      name: identity.name,
+      materialized: identity.materialized,
+      columns: identity.columns.map((column) => nameOf(column)).sort(),
+    };
+  });
+  inventoryViews.sort((a, b) => `${a.schema}.${a.name}`.localeCompare(`${b.schema}.${b.name}`));
+  inventoryIndexes.sort((a, b) => `${a.schema}.${a.table}.${a.name}`.localeCompare(`${b.schema}.${b.table}.${b.name}`));
+  inventoryConstraints.sort((a, b) => `${a.schema}.${a.table}.${a.name}`.localeCompare(`${b.schema}.${b.table}.${b.name}`));
 
   const partitionedTables = snapshotPartitionedTables(extras, nameOf);
   const partitions = snapshotPartitions(extras, partitionedTables);
@@ -232,7 +346,14 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
     partitionedTables,
     partitions,
     detaches,
-    inventory: { scanned: true, tables: inventoryTables },
+    inventory: {
+      scanned: true,
+      tables: inventoryTables,
+      enums: inventoryEnums,
+      views: inventoryViews,
+      indexes: inventoryIndexes,
+      constraints: inventoryConstraints,
+    },
   };
 }
 
@@ -254,8 +375,7 @@ function pushComment(comments: CommentSnapshot[], snap: CommentSnapshot): void {
     return;
   }
   if (existing.text !== snap.text) {
-    const target = snap.kind === "table" ? `${snap.schema}.${snap.table}` : `${snap.schema}.${snap.table}.${snap.column}`;
-    throw new PgExtrasError(`comment on ${target} is declared twice with different text`);
+    throw new PgExtrasError(`comment on ${commentLabel(snap)} is declared twice with different text`);
   }
 }
 
@@ -429,59 +549,52 @@ function harvest(table: PgTable, nameOf: (column: AnyPgColumn) => string): { tab
   for (const column of Object.values(getTableColumns(table))) {
     const text = readComment(column);
     if (!text) continue;
-    const dbName = nameOf(column);
-    columns.push({
-      id: JSON.stringify(["column", identity.schema, identity.name, dbName]),
-      kind: "column",
-      schema: identity.schema,
-      table: identity.name,
-      column: dbName,
-      text,
-    });
+    columns.push(columnComment(identity.schema, identity.name, nameOf(column), text));
   }
   const tableText = readComment(table);
   return {
-    table: tableText
-      ? {
-          id: JSON.stringify(["table", identity.schema, identity.name, null]),
-          kind: "table",
-          schema: identity.schema,
-          table: identity.name,
-          column: null,
-          text: tableText,
-        }
-      : null,
+    table: tableText ? tableComment(identity.schema, identity.name, tableText) : null,
     columns,
   };
 }
 
-function snapshotComment(comment: PgComment, nameOf: (column: AnyPgColumn) => string): CommentSnapshot {
-  if (is(comment.target, PgTable)) {
-    const identity = tableIdentity(comment.target);
-    return {
-      id: JSON.stringify(["table", identity.schema, identity.name, null]),
-      kind: "table",
-      schema: identity.schema,
-      table: identity.name,
-      column: null,
-      text: comment.text,
-    };
+function snapshotComment(
+  comment: PgComment,
+  nameOf: (column: AnyPgColumn) => string,
+  casing: Casing | undefined,
+  fnByObject: Map<PgFunction, FunctionSnapshot>,
+  triggerByObject: Map<PgTrigger, TriggerSnapshot>,
+  extras: PgExtras,
+): CommentSnapshot {
+  const target = comment.target;
+  if (is(target, PgTable)) {
+    const identity = tableIdentity(target);
+    return tableComment(identity.schema, identity.name, comment.text);
   }
-  const column = comment.target;
-  if (!column.table || !is(column.table, PgTable)) {
-    throw new PgExtrasError(`commentOn() column "${column.name}" is not attached to a Postgres table`);
+  if (is(target, Column)) {
+    return columnCommentFrom(target, comment.text, nameOf, extras);
   }
-  assertColumnOfTable(column.table, column);
-  const identity = tableIdentity(column.table);
-  const dbName = nameOf(column);
-  return {
-    id: JSON.stringify(["column", identity.schema, identity.name, dbName]),
-    kind: "column",
-    schema: identity.schema,
-    table: identity.name,
-    column: dbName,
-    text: comment.text,
-  };
+  if (isPgEnum(target)) {
+    return enumComment(enumIdentity(target), comment.text);
+  }
+  if (isPgView(target) || isPgMaterializedView(target)) {
+    const identity = viewIdentity(target);
+    return viewComment(identity.schema, identity.name, identity.materialized, comment.text);
+  }
+  if (extrasKind(target) === "function") {
+    const fn = target as PgFunction;
+    const snap = fnByObject.get(fn) ?? snapshotFunction(fn, casing);
+    return functionComment(snap, comment.text);
+  }
+  if (extrasKind(target) === "trigger") {
+    const trigger = target as PgTrigger;
+    const snap = triggerByObject.get(trigger) ?? snapshotTrigger(trigger, casing, nameOf, fnByObject, ownedUpdatedAt(trigger, nameOf));
+    return triggerComment(snap, comment.text);
+  }
+  if (extrasKind(target) === "extension") {
+    return extensionComment((target as PgExtras["extensions"][number]).name, comment.text);
+  }
+  throw new PgExtrasError("commentOn() takes a table, column, enum, view, function, trigger, or extension");
 }
 
 export function sameFunction(a: FunctionSnapshot, b: FunctionSnapshot): boolean {
@@ -509,19 +622,421 @@ export function sameTrigger(a: TriggerSnapshot, b: TriggerSnapshot): boolean {
 
 export function parseSnapshot(value: unknown): Snapshot {
   if (!value || typeof value !== "object") throw new PgExtrasError("pg extras snapshot is not an object");
-  const record = value as Partial<Snapshot>;
+  const record = value as Partial<Snapshot> & { comments?: unknown; inventory?: unknown };
   if (record.version !== 1) throw new PgExtrasError(`pg extras snapshot version ${String(record.version)} is not supported`);
+  const comments = Array.isArray(record.comments) ? record.comments.map((comment) => normalizeComment(comment)) : [];
   return {
     version: 1,
     functions: record.functions ?? [],
     triggers: record.triggers ?? [],
     extensions: record.extensions ?? [],
-    comments: record.comments ?? [],
+    comments,
     partitionedTables: record.partitionedTables ?? [],
     partitions: record.partitions ?? [],
     detaches: record.detaches ?? [],
-    inventory: record.inventory ?? { scanned: false, tables: [] },
+    inventory: normalizeInventory(record.inventory),
   };
+}
+
+const COMMENT_KINDS = new Set<CommentKind>([
+  "table",
+  "column",
+  "enum",
+  "view",
+  "materializedView",
+  "function",
+  "trigger",
+  "index",
+  "constraint",
+  "extension",
+]);
+
+function normalizeComment(value: unknown): CommentSnapshot {
+  if (!value || typeof value !== "object") throw new PgExtrasError("pg extras snapshot comment is not an object");
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.kind !== "string" || !COMMENT_KINDS.has(raw.kind as CommentKind)) {
+    throw new PgExtrasError(`pg extras snapshot has an unknown comment kind ${String(raw.kind)}`);
+  }
+  const kind = raw.kind as CommentKind;
+  const schema = typeof raw.schema === "string" ? raw.schema : "public";
+  const column = typeof raw.column === "string" ? raw.column : null;
+  const legacyRelation = typeof raw.table === "string" ? raw.table : null;
+  const relation = typeof raw.relation === "string" ? raw.relation : legacyRelation;
+  const name =
+    typeof raw.name === "string" ? raw.name : kind === "column" ? (column ?? "") : (legacyRelation ?? "");
+  if (name.length === 0) throw new PgExtrasError("pg extras snapshot comment is missing a name");
+  if (typeof raw.text !== "string") throw new PgExtrasError("pg extras snapshot comment is missing text");
+  const argTypes = Array.isArray(raw.argTypes) ? raw.argTypes.filter((item): item is string => typeof item === "string") : [];
+  const id = typeof raw.id === "string" ? raw.id : JSON.stringify([kind, schema, relation, name]);
+  return { id, kind, schema, name, relation, column, argTypes, text: raw.text };
+}
+
+function normalizeInventory(value: unknown): Snapshot["inventory"] {
+  const empty = emptySnapshot().inventory;
+  if (!value || typeof value !== "object") return empty;
+  const raw = value as Partial<Snapshot["inventory"]>;
+  return {
+    scanned: raw.scanned === true,
+    tables: Array.isArray(raw.tables) ? raw.tables : [],
+    enums: Array.isArray(raw.enums) ? raw.enums : [],
+    views: Array.isArray(raw.views) ? raw.views : [],
+    indexes: Array.isArray(raw.indexes) ? raw.indexes : [],
+    constraints: Array.isArray(raw.constraints) ? raw.constraints : [],
+  };
+}
+
+function tableComment(schema: string, table: string, text: string): CommentSnapshot {
+  return {
+    id: JSON.stringify(["table", schema, table, null]),
+    kind: "table",
+    schema,
+    name: table,
+    relation: table,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function columnComment(schema: string, relation: string, column: string, text: string): CommentSnapshot {
+  return {
+    id: JSON.stringify(["column", schema, relation, column]),
+    kind: "column",
+    schema,
+    name: column,
+    relation,
+    column,
+    argTypes: [],
+    text,
+  };
+}
+
+function enumComment(identity: { schema: string; name: string }, text: string): CommentSnapshot {
+  return {
+    id: JSON.stringify(["enum", identity.schema, identity.name]),
+    kind: "enum",
+    schema: identity.schema,
+    name: identity.name,
+    relation: null,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function viewComment(schema: string, name: string, materialized: boolean, text: string): CommentSnapshot {
+  const kind = materialized ? "materializedView" : "view";
+  return {
+    id: JSON.stringify([kind, schema, name]),
+    kind,
+    schema,
+    name,
+    relation: null,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function functionComment(fn: FunctionSnapshot, text: string): CommentSnapshot {
+  const argTypes = fn.args.map((arg) => arg.type);
+  return {
+    id: JSON.stringify(["function", fn.schema, fn.name, argTypes]),
+    kind: "function",
+    schema: fn.schema,
+    name: fn.name,
+    relation: null,
+    column: null,
+    argTypes,
+    text,
+  };
+}
+
+function triggerComment(trigger: TriggerSnapshot, text: string): CommentSnapshot {
+  return {
+    id: trigger.id,
+    kind: "trigger",
+    schema: trigger.schema,
+    name: trigger.name,
+    relation: trigger.table,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function extensionComment(name: string, text: string): CommentSnapshot {
+  return {
+    id: JSON.stringify(["extension", name]),
+    kind: "extension",
+    schema: "public",
+    name,
+    relation: null,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function indexComment(schema: string, name: string, text: string): CommentSnapshot {
+  return {
+    id: JSON.stringify(["index", schema, name]),
+    kind: "index",
+    schema,
+    name,
+    relation: null,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function constraintComment(schema: string, table: string, name: string, text: string): CommentSnapshot {
+  return {
+    id: JSON.stringify(["constraint", schema, table, name]),
+    kind: "constraint",
+    schema,
+    name,
+    relation: table,
+    column: null,
+    argTypes: [],
+    text,
+  };
+}
+
+function commentLabel(comment: CommentSnapshot): string {
+  if (comment.kind === "column") return `${comment.schema}.${comment.relation}.${comment.column}`;
+  if (comment.kind === "function") return `function ${comment.schema}.${comment.name}(${comment.argTypes.join(", ")})`;
+  if (comment.kind === "trigger" || comment.kind === "constraint") {
+    return `${comment.kind} ${comment.name} on ${comment.schema}.${comment.relation}`;
+  }
+  if (comment.kind === "extension") return `extension ${comment.name}`;
+  return `${comment.kind} ${comment.schema}.${comment.name}`;
+}
+
+function columnCommentFrom(
+  column: AnyPgColumn,
+  text: string,
+  nameOf: (column: AnyPgColumn) => string,
+  extras: PgExtras,
+): CommentSnapshot {
+  if (!column.table || !is(column.table, PgTable)) {
+    throw new PgExtrasError(`commentOn() column "${column.name}" is not attached to a Postgres table or view`);
+  }
+  const identity = tableIdentity(column.table);
+  const dbName = nameOf(column);
+  const knownTable = extras.tables.find((table) => {
+    const id = tableIdentity(table);
+    return id.schema === identity.schema && id.name === identity.name;
+  });
+  if (knownTable) {
+    assertColumnOfTable(knownTable, column);
+    return columnComment(identity.schema, identity.name, dbName, text);
+  }
+  const view = extras.views.find((item) => viewIdentity(item).name === identity.name);
+  if (view) {
+    const viewId = viewIdentity(view);
+    return columnComment(viewId.schema, viewId.name, dbName, text);
+  }
+  assertColumnOfTable(column.table, column);
+  return columnComment(identity.schema, identity.name, dbName, text);
+}
+
+const ExtraConfigBuilder = Symbol.for("drizzle:ExtraConfigBuilder");
+const ExtraConfigColumns = Symbol.for("drizzle:ExtraConfigColumns");
+
+function readExtraConfig(table: PgTable): unknown[] {
+  const builder = (table as unknown as Record<symbol, unknown>)[ExtraConfigBuilder];
+  if (typeof builder !== "function") return [];
+  const columns = (table as unknown as Record<symbol, unknown>)[ExtraConfigColumns];
+  const extra = (builder as (value: unknown) => unknown)(columns);
+  if (!extra || typeof extra !== "object") return [];
+  return Array.isArray(extra) ? extra.flat(1) : Object.values(extra);
+}
+
+function harvestRelations(
+  table: PgTable,
+  nameOf: (column: AnyPgColumn) => string,
+  casing: Casing | undefined,
+): { comments: CommentSnapshot[]; indexes: InventoryIndex[]; constraints: InventoryConstraint[] } {
+  const identity = tableIdentity(table);
+  const comments: CommentSnapshot[] = [];
+  const indexes: InventoryIndex[] = [];
+  const constraints: InventoryConstraint[] = [];
+  for (const value of readExtraConfig(table)) {
+    if (extrasKind(value) === "comment") {
+      throw new PgExtrasError(
+        "Return the index or constraint from the table extra config wrapped with withComment(). commentOn() is for tables, columns, enums, views, functions, triggers, and extensions.",
+      );
+    }
+    if (is(value, IndexBuilder)) {
+      const built = value.build(table);
+      const text = readComment(value);
+      let name: string;
+      try {
+        name = resolveIndexName(built, identity.name, casing);
+      } catch (error) {
+        if (text) throw error;
+        continue;
+      }
+      indexes.push({ schema: identity.schema, table: identity.name, name });
+      if (text) comments.push(indexComment(identity.schema, name, text));
+      continue;
+    }
+    if (is(value, CheckBuilder)) {
+      const name = value.name;
+      constraints.push({ schema: identity.schema, table: identity.name, name });
+      const text = readComment(value);
+      if (text) comments.push(constraintComment(identity.schema, identity.name, name, text));
+      continue;
+    }
+    if (is(value, UniqueConstraintBuilder)) {
+      const built = buildOf<UniqueConstraint>(value, table);
+      const name = constraintName(built);
+      constraints.push({ schema: identity.schema, table: identity.name, name });
+      const text = readComment(value);
+      if (text) comments.push(constraintComment(identity.schema, identity.name, name, text));
+      continue;
+    }
+    if (is(value, ForeignKeyBuilder)) {
+      const built = buildOf<ForeignKey>(value, table);
+      const name = applyCasing(built.getName(), [...built.reference().columns, ...built.reference().foreignColumns], nameOf, casing);
+      constraints.push({ schema: identity.schema, table: identity.name, name });
+      const text = readComment(value);
+      if (text) comments.push(constraintComment(identity.schema, identity.name, name, text));
+      continue;
+    }
+    if (is(value, PrimaryKeyBuilder)) {
+      const built = buildOf<PrimaryKey>(value, table);
+      const name = applyCasing(built.getName(), built.columns, nameOf, casing);
+      constraints.push({ schema: identity.schema, table: identity.name, name });
+      const text = readComment(value);
+      if (text) comments.push(constraintComment(identity.schema, identity.name, name, text));
+    }
+  }
+  return { comments, indexes, constraints };
+}
+
+function buildOf<T>(builder: object, table: PgTable): T {
+  return (builder as { build(table: PgTable): T }).build(table);
+}
+
+function constraintName(constraint: { name?: string; getName(): string | undefined }): string {
+  const name = constraint.name ?? constraint.getName();
+  if (!name) throw new PgExtrasError("constraint comment needs a constraint name");
+  return name;
+}
+
+function applyCasing(
+  name: string,
+  columns: readonly AnyPgColumn[],
+  nameOf: (column: AnyPgColumn) => string,
+  casing: Casing | undefined,
+): string {
+  if (!casing) return name;
+  let result = name;
+  for (const column of columns) {
+    const cased = nameOf(column);
+    if (column.name !== cased) result = result.replace(column.name, cased);
+  }
+  return result;
+}
+
+function resolveIndexName(index: Index, tableName: string, casing: Casing | undefined): string {
+  if (index.config.name && index.config.name.length > 0) return index.config.name;
+  const columns: string[] = [];
+  for (const column of index.config.columns) {
+    if (is(column, SQL)) {
+      throw new PgExtrasError(
+        `index comment on "${tableName}" needs an index name. Drizzle names indexes made of columns only; name an index whose key is a SQL expression.`,
+      );
+    }
+    const indexed = column as { name?: string; keyAsName?: boolean };
+    if (!indexed.name) {
+      throw new PgExtrasError(`index comment on "${tableName}" needs an index name`);
+    }
+    columns.push(casedIndexColumn(indexed.name, Boolean(indexed.keyAsName), casing));
+  }
+  return `${tableName}_${columns.join("_")}_index`;
+}
+
+function casedIndexColumn(name: string, keyAsName: boolean, casing: Casing | undefined): string {
+  if (!keyAsName || !casing) return name;
+  return casing === "camelCase" ? toCamelCase(name) : toSnakeCase(name);
+}
+
+function harvestView(view: PgViewLike, nameOf: (column: AnyPgColumn) => string): CommentSnapshot[] {
+  const identity = viewIdentity(view);
+  const comments: CommentSnapshot[] = [];
+  const text = readComment(view);
+  if (text) comments.push(viewComment(identity.schema, identity.name, identity.materialized, text));
+  for (const column of identity.columns) {
+    const columnText = readComment(column);
+    if (!columnText) continue;
+    comments.push(columnComment(identity.schema, identity.name, nameOf(column), columnText));
+  }
+  return comments;
+}
+
+function viewIdentity(view: PgViewLike): { schema: string; name: string; materialized: boolean; columns: AnyPgColumn[] } {
+  const materialized = isPgMaterializedView(view);
+  const config = materialized ? getMaterializedViewConfig(view) : getViewConfig(view as PgView);
+  const columns: AnyPgColumn[] = [];
+  for (const field of Object.values(config.selectedFields ?? {})) {
+    if (is(field, Column)) columns.push(field as AnyPgColumn);
+  }
+  return {
+    schema: config.schema && config.schema.length > 0 ? config.schema : "public",
+    name: config.name,
+    materialized,
+    columns,
+  };
+}
+
+function enumObjectsIn(extras: PgExtras): AnyPgEnum[] {
+  const found: AnyPgEnum[] = [];
+  const add = (value: unknown) => {
+    if (!isPgEnum(value) || found.includes(value as AnyPgEnum)) return;
+    found.push(value as AnyPgEnum);
+  };
+  for (const enumObject of extras.enums) add(enumObject);
+  for (const comment of extras.comments) add(comment.target);
+  for (const table of extras.tables) {
+    for (const column of Object.values(getTableColumns(table))) add(enumFromColumn(column));
+  }
+  for (const view of extras.views) {
+    for (const column of viewIdentity(view).columns) add(enumFromColumn(column));
+  }
+  return found;
+}
+
+function enumFromColumn(column: AnyPgColumn): AnyPgEnum | null {
+  let current: object = column;
+  while (is(current, PgArray)) current = current.baseColumn;
+  if (is(current, PgEnumColumn) || is(current, PgEnumObjectColumn)) return current.enum as AnyPgEnum;
+  return null;
+}
+
+function enumIdentity(value: unknown): { schema: string; name: string } {
+  const enumObject = value as { enumName?: string; schema?: string };
+  if (!enumObject.enumName) throw new PgExtrasError("enum comment is missing an enum name");
+  return {
+    schema: enumObject.schema && enumObject.schema.length > 0 ? enumObject.schema : "public",
+    name: enumObject.enumName,
+  };
+}
+
+function uniqueNames(items: readonly { schema: string; name: string }[]): InventoryName[] {
+  const seen = new Set<string>();
+  const names: InventoryName[] = [];
+  for (const item of items) {
+    const key = `${item.schema}.${item.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push({ schema: item.schema, name: item.name });
+  }
+  names.sort((a, b) => `${a.schema}.${a.name}`.localeCompare(`${b.schema}.${b.name}`));
+  return names;
 }
 
 function snapshotPartitionedTables(

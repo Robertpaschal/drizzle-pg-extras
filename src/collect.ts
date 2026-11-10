@@ -1,8 +1,9 @@
 import { is } from "drizzle-orm";
-import { PgTable } from "drizzle-orm/pg-core";
+import { PgTable, isPgEnum, isPgMaterializedView, isPgView } from "drizzle-orm/pg-core";
 import {
   extrasKind,
   isPlainRecord,
+  type AnyPgEnum,
   type PartitionedTable,
   type PgComment,
   type PgDetach,
@@ -11,6 +12,7 @@ import {
   type PgFunction,
   type PgPartition,
   type PgTrigger,
+  type PgViewLike,
 } from "./defs.js";
 
 export function collectExtras(modules: Record<string, unknown> | readonly Record<string, unknown>[]): PgExtras {
@@ -20,6 +22,8 @@ export function collectExtras(modules: Record<string, unknown> | readonly Record
     extensions: [],
     comments: [],
     tables: [],
+    enums: [],
+    views: [],
     partitionedTables: [],
     partitions: [],
     detaches: [],
@@ -42,6 +46,8 @@ export function defineExtras(input: {
   extensions?: readonly PgExtension[];
   comments?: readonly PgComment[];
   tables?: readonly PgTable[];
+  enums?: readonly AnyPgEnum[];
+  views?: readonly PgViewLike[];
   partitionedTables?: readonly PartitionedTable[];
   partitions?: readonly PgPartition[];
   detaches?: readonly PgDetach[];
@@ -52,6 +58,8 @@ export function defineExtras(input: {
     extensions: input.extensions ?? [],
     comments: input.comments ?? [],
     tables: input.tables ?? [],
+    enums: input.enums ?? [],
+    views: input.views ?? [],
     partitionedTables: input.partitionedTables ?? [],
     partitions: input.partitions ?? [],
     detaches: input.detaches ?? [],
@@ -60,6 +68,10 @@ export function defineExtras(input: {
 
 function walk(value: unknown, extras: PgExtras, seen: Set<unknown>): void {
   if (value === null || value === undefined) return;
+  if (typeof value === "function") {
+    if (isPgEnum(value)) pushEnum(extras, value);
+    return;
+  }
   if (typeof value !== "object") return;
   if (seen.has(value)) return;
   seen.add(value);
@@ -95,6 +107,10 @@ function walk(value: unknown, extras: PgExtras, seen: Set<unknown>): void {
     extras.detaches.push(value as PgDetach);
     return;
   }
+  if (isPgView(value) || isPgMaterializedView(value)) {
+    pushView(extras, value);
+    return;
+  }
   if (is(value, PgTable)) {
     if (!extras.tables.includes(value)) extras.tables.push(value);
     return;
@@ -106,4 +122,13 @@ function walk(value: unknown, extras: PgExtras, seen: Set<unknown>): void {
   if (isPlainRecord(value)) {
     for (const entry of Object.values(value)) walk(entry, extras, seen);
   }
+}
+
+function pushEnum(extras: PgExtras, value: unknown): void {
+  const enumObject = value as AnyPgEnum;
+  if (!extras.enums.includes(enumObject)) extras.enums.push(enumObject);
+}
+
+function pushView(extras: PgExtras, value: PgViewLike): void {
+  if (!extras.views.includes(value)) extras.views.push(value);
 }

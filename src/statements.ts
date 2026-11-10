@@ -1,3 +1,4 @@
+import { PgExtrasError } from "./errors.js";
 import { dollarQuote, qualify, quoteIdent, quoteLiteral } from "./quote.js";
 import type { CommentSnapshot, ExtensionSnapshot, FunctionSnapshot, TriggerSnapshot } from "./snapshot.js";
 
@@ -67,10 +68,44 @@ export function dropExtensionSql(ext: ExtensionSnapshot): string {
 }
 
 export function commentSql(comment: CommentSnapshot, text: string | null): string {
-  const target =
-    comment.kind === "table"
-      ? `TABLE ${qualify(comment.schema, comment.table)}`
-      : `COLUMN ${qualify(comment.schema, comment.table)}.${quoteIdent(comment.column ?? "")}`;
+  const relation = comment.relation ?? comment.name;
+  let target: string;
+  switch (comment.kind) {
+    case "table":
+      target = `TABLE ${qualify(comment.schema, comment.name)}`;
+      break;
+    case "column":
+      target = `COLUMN ${qualify(comment.schema, relation)}.${quoteIdent(comment.column ?? comment.name)}`;
+      break;
+    case "enum":
+      target = `TYPE ${qualify(comment.schema, comment.name)}`;
+      break;
+    case "view":
+      target = `VIEW ${qualify(comment.schema, comment.name)}`;
+      break;
+    case "materializedView":
+      target = `MATERIALIZED VIEW ${qualify(comment.schema, comment.name)}`;
+      break;
+    case "function":
+      target = `FUNCTION ${qualify(comment.schema, comment.name)}(${(comment.argTypes ?? []).join(", ")})`;
+      break;
+    case "trigger":
+      target = `TRIGGER ${quoteIdent(comment.name)} ON ${qualify(comment.schema, relation)}`;
+      break;
+    case "index":
+      target = `INDEX ${qualify(comment.schema, comment.name)}`;
+      break;
+    case "constraint":
+      target = `CONSTRAINT ${quoteIdent(comment.name)} ON ${qualify(comment.schema, relation)}`;
+      break;
+    case "extension":
+      target = `EXTENSION ${quoteIdent(comment.name)}`;
+      break;
+    default: {
+      const unknown: never = comment.kind;
+      throw new PgExtrasError(`unknown comment kind ${String(unknown)}`);
+    }
+  }
   return `COMMENT ON ${target} IS ${text === null ? "NULL" : quoteLiteral(text)};`;
 }
 

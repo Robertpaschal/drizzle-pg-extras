@@ -7,8 +7,8 @@ import {
   dropPartitionSql,
 } from "./partition-sql.js";
 import { quoteIdent, quoteLiteral } from "./quote.js";
-import type { CommentSnapshot, PartitionedTableSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
-import { sameFunction, sameTrigger } from "./snapshot.js";
+import type { CommentSnapshot, InventoryView, PartitionedTableSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
+import { functionSignature, sameFunction, sameTrigger } from "./snapshot.js";
 import {
   commentSql,
   createExtensionSql,
@@ -43,8 +43,13 @@ export function idempotentStatements(snapshot: Snapshot): string[] {
   for (const fn of snapshot.functions) statements.push(createFunctionSql(fn));
   if (sqlFunctions) statements.push("SET check_function_bodies = on");
   statements.push(...partitionStatements(snapshot));
-  for (const comment of snapshot.comments) statements.push(commentSql(comment, comment.text));
+  for (const comment of snapshot.comments) {
+    if (comment.kind !== "trigger") statements.push(commentSql(comment, comment.text));
+  }
   for (const trigger of snapshot.triggers) statements.push(createTriggerSql(trigger));
+  for (const comment of snapshot.comments) {
+    if (comment.kind === "trigger") statements.push(commentSql(comment, comment.text));
+  }
   return statements;
 }
 
@@ -83,6 +88,7 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
     }
   }
   triggersToDrop.sort((a, b) => a.id.localeCompare(b.id));
+  const droppedTriggerIds = new Set(triggersToDrop.map((trigger) => trigger.id));
 
   const statements: string[] = [];
   for (const trigger of triggersToDrop) statements.push(dropTriggerSql(trigger));
@@ -114,20 +120,8 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
   for (const fn of fnsToWrite) statements.push(createFunctionSql(fn));
   if (needsBodyOff) statements.push("SET check_function_bodies = on");
 
-  const commentIds = new Set([...fromComments.keys(), ...toComments.keys()]);
-  for (const id of [...commentIds].sort()) {
-    const prev = fromComments.get(id);
-    const next = toComments.get(id);
-    if (prev && next && prev.text === next.text) continue;
-    if (!next && prev) {
-      if (skipDroppedTables && targetGone(from, to, prev)) continue;
-      statements.push(commentSql(prev, null));
-      continue;
-    }
-    if (next) statements.push(commentSql(next, next.text));
-  }
+  emitComments(statements, from, to, fromComments, toComments, dropFnIds, toFns, droppedTriggerIds, toTriggers, toExt, skipDroppedTables, "other");
 
-  const droppedTriggerIds = new Set(triggersToDrop.map((trigger) => trigger.id));
   for (const trigger of to.triggers) {
     const prev = fromTriggers.get(trigger.id);
     if (!prev || !sameTrigger(prev, trigger) || droppedTriggerIds.has(trigger.id)) {
@@ -135,11 +129,76 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
     }
   }
 
+  emitComments(statements, from, to, fromComments, toComments, dropFnIds, toFns, droppedTriggerIds, toTriggers, toExt, skipDroppedTables, "trigger");
+
   for (const ext of [...from.extensions].sort((a, b) => a.id.localeCompare(b.id))) {
     if (!toExt.has(ext.id)) statements.push(dropExtensionSql(ext));
   }
 
   return statements;
+}
+
+function emitComments(
+  statements: string[],
+  from: Snapshot,
+  to: Snapshot,
+  fromComments: Map<string, CommentSnapshot>,
+  toComments: Map<string, CommentSnapshot>,
+  dropFnIds: Set<string>,
+  toFns: Map<string, Snapshot["functions"][number]>,
+  droppedTriggerIds: Set<string>,
+  toTriggers: Map<string, TriggerSnapshot>,
+  toExt: Map<string, Snapshot["extensions"][number]>,
+  skipDroppedTables: boolean,
+  mode: "trigger" | "other",
+): void {
+  const ids = [...new Set([...fromComments.keys(), ...toComments.keys()])].sort();
+  for (const id of ids) {
+    const prev = fromComments.get(id);
+    const next = toComments.get(id);
+    const subject = next ?? prev;
+    if (!subject) continue;
+    if (mode === "trigger" ? subject.kind !== "trigger" : subject.kind === "trigger") continue;
+    if (prev && next && prev.text === next.text && !commentRewritten(next, dropFnIds, toFns, droppedTriggerIds, toTriggers)) {
+      continue;
+    }
+    if (!next && prev) {
+      if (skipCommentNull(prev, to, toFns, toTriggers, toExt, skipDroppedTables, from)) continue;
+      statements.push(commentSql(prev, null));
+      continue;
+    }
+    if (next) statements.push(commentSql(next, next.text));
+  }
+}
+
+function commentRewritten(
+  comment: CommentSnapshot,
+  dropFnIds: Set<string>,
+  toFns: Map<string, Snapshot["functions"][number]>,
+  droppedTriggerIds: Set<string>,
+  toTriggers: Map<string, TriggerSnapshot>,
+): boolean {
+  if (comment.kind === "function") {
+    const id = functionSignature(comment.schema, comment.name, comment.argTypes ?? []);
+    return dropFnIds.has(id) && toFns.has(id);
+  }
+  if (comment.kind === "trigger") return droppedTriggerIds.has(comment.id) && toTriggers.has(comment.id);
+  return false;
+}
+
+function skipCommentNull(
+  comment: CommentSnapshot,
+  to: Snapshot,
+  toFns: Map<string, Snapshot["functions"][number]>,
+  toTriggers: Map<string, TriggerSnapshot>,
+  toExt: Map<string, Snapshot["extensions"][number]>,
+  skipDroppedTables: boolean,
+  from: Snapshot,
+): boolean {
+  if (comment.kind === "function") return !toFns.has(functionSignature(comment.schema, comment.name, comment.argTypes ?? []));
+  if (comment.kind === "trigger") return !toTriggers.has(comment.id);
+  if (comment.kind === "extension") return !toExt.has(comment.name);
+  return skipDroppedTables && targetGone(from, to, comment);
 }
 
 function partitionChanges(from: Snapshot, to: Snapshot, skipDroppedTables: boolean): string[] {
@@ -224,11 +283,51 @@ function tableGone(from: Snapshot, to: Snapshot, schema: string, table: string):
 }
 
 function targetGone(from: Snapshot, to: Snapshot, comment: CommentSnapshot): boolean {
-  if (tableGone(from, to, comment.schema, comment.table)) return true;
-  if (comment.kind !== "column" || !comment.column) return false;
   if (!from.inventory.scanned || !to.inventory.scanned) return false;
-  const prev = from.inventory.tables.find((item) => item.schema === comment.schema && item.name === comment.table);
-  const next = to.inventory.tables.find((item) => item.schema === comment.schema && item.name === comment.table);
+  const relation = comment.relation ?? comment.name;
+  if (comment.kind === "table" || comment.kind === "column") {
+    if (tableGone(from, to, comment.schema, relation)) return true;
+    if (comment.kind !== "column" || !comment.column) return false;
+    const prev = from.inventory.tables.find((item) => item.schema === comment.schema && item.name === relation);
+    const next = to.inventory.tables.find((item) => item.schema === comment.schema && item.name === relation);
+    if (prev && next) return prev.columns.includes(comment.column) && !next.columns.includes(comment.column);
+    return viewColumnGone(from, to, comment.schema, relation, comment.column);
+  }
+  if (comment.kind === "enum") return namedGone(from.inventory.enums, to.inventory.enums, comment.schema, comment.name);
+  if (comment.kind === "view" || comment.kind === "materializedView") {
+    return viewGone(from.inventory.views, to.inventory.views, comment.schema, comment.name, comment.kind === "materializedView");
+  }
+  if (comment.kind === "index") {
+    return listedGone(from.inventory.indexes, to.inventory.indexes, comment.schema, comment.name);
+  }
+  if (comment.kind === "constraint") {
+    const had = from.inventory.constraints.some((item) => item.schema === comment.schema && item.table === relation && item.name === comment.name);
+    const has = to.inventory.constraints.some((item) => item.schema === comment.schema && item.table === relation && item.name === comment.name);
+    return had && !has;
+  }
+  return false;
+}
+
+function namedGone(from: readonly { schema: string; name: string }[], to: readonly { schema: string; name: string }[], schema: string, name: string): boolean {
+  const had = from.some((item) => item.schema === schema && item.name === name);
+  const has = to.some((item) => item.schema === schema && item.name === name);
+  return had && !has;
+}
+
+function listedGone(from: readonly { schema: string; name: string }[], to: readonly { schema: string; name: string }[], schema: string, name: string): boolean {
+  return namedGone(from, to, schema, name);
+}
+
+function viewGone(from: readonly InventoryView[], to: readonly InventoryView[], schema: string, name: string, materialized: boolean): boolean {
+  const had = from.some((item) => item.schema === schema && item.name === name && item.materialized === materialized);
+  const has = to.some((item) => item.schema === schema && item.name === name && item.materialized === materialized);
+  return had && !has;
+}
+
+function viewColumnGone(from: Snapshot, to: Snapshot, schema: string, relation: string, column: string): boolean {
+  const prev = from.inventory.views.find((item) => item.schema === schema && item.name === relation);
+  const next = to.inventory.views.find((item) => item.schema === schema && item.name === relation);
+  if (prev && !next) return true;
   if (!prev || !next) return false;
-  return prev.columns.includes(comment.column) && !next.columns.includes(comment.column);
+  return prev.columns.includes(column) && !next.columns.includes(column);
 }
