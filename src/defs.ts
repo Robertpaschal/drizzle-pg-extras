@@ -14,7 +14,14 @@ import { assertIdentifier } from "./quote.js";
 const KIND = Symbol.for("drizzle-pg-extras.kind");
 const COMMENT = Symbol.for("drizzle-pg-extras.comment");
 
-export type ExtrasKind = "function" | "trigger" | "extension" | "comment";
+export type ExtrasKind =
+  | "function"
+  | "trigger"
+  | "extension"
+  | "comment"
+  | "partitionedTable"
+  | "partition"
+  | "detach";
 
 export type PgLanguage = "plpgsql" | "sql";
 export type PgVolatility = "volatile" | "stable" | "immutable";
@@ -111,12 +118,52 @@ export type PgComment = {
   readonly text: string;
 };
 
+export type PartitionMethod = "range" | "list" | "hash";
+
+/** A bound written into `FOR VALUES`. `MINVALUE` and `MAXVALUE` are range keywords, not strings. */
+export type PartitionBound = string | number | boolean | null | bigint | "MINVALUE" | "MAXVALUE";
+
+export type PartitionParent = PgTable | PartitionedTable | { name: string; schema?: string };
+
+export type PartitionBoundSpec =
+  | { kind: "range"; from: readonly PartitionBound[]; to: readonly PartitionBound[] }
+  | { kind: "list"; values: readonly (PartitionBound | readonly PartitionBound[])[] }
+  | { kind: "hash"; modulus: number; remainder: number }
+  | { kind: "default" };
+
+export type PartitionedTable = {
+  readonly [KIND]: "partitionedTable";
+  readonly table: PgTable | { name: string; schema?: string };
+  readonly method: PartitionMethod;
+  readonly columns: readonly (AnyPgColumn | string)[];
+};
+
+export type PgPartition = {
+  readonly [KIND]: "partition";
+  readonly name: string;
+  readonly schema: string | null;
+  readonly parent: PartitionParent;
+  readonly mode: "create" | "attach";
+  /** Used when this declaration is removed. `drop` deletes the child. `detach` keeps the table. */
+  readonly onRemove: "drop" | "detach";
+  readonly bound: PartitionBoundSpec;
+};
+
+export type PgDetach = {
+  readonly [KIND]: "detach";
+  readonly table: PgTable | { name: string; schema?: string };
+  readonly parent: PartitionParent;
+};
+
 export type PgExtras = {
   functions: PgFunction[];
   triggers: PgTrigger[];
   extensions: PgExtension[];
   comments: PgComment[];
   tables: PgTable[];
+  partitionedTables: PartitionedTable[];
+  partitions: PgPartition[];
+  detaches: PgDetach[];
 };
 
 function brand<T extends object, K extends ExtrasKind>(value: T, kind: K): T & { readonly [KIND]: K } {
@@ -127,7 +174,17 @@ function brand<T extends object, K extends ExtrasKind>(value: T, kind: K): T & {
 export function extrasKind(value: unknown): ExtrasKind | null {
   if (typeof value !== "object" || value === null) return null;
   const kind = (value as { [KIND]?: unknown })[KIND];
-  if (kind === "function" || kind === "trigger" || kind === "extension" || kind === "comment") return kind;
+  if (
+    kind === "function" ||
+    kind === "trigger" ||
+    kind === "extension" ||
+    kind === "comment" ||
+    kind === "partitionedTable" ||
+    kind === "partition" ||
+    kind === "detach"
+  ) {
+    return kind;
+  }
   return null;
 }
 
@@ -429,6 +486,300 @@ export function tableIdentity(table: PgTable | { name: string; schema?: string }
     return { schema: config.schema && config.schema.length > 0 ? config.schema : "public", name: config.name };
   }
   return { schema: table.schema && table.schema.length > 0 ? table.schema : "public", name: table.name };
+}
+
+const PARTITION_METHODS = new Set<PartitionMethod>(["range", "list", "hash"]);
+
+/**
+ * Declare that a drizzle-kit table should become partitioned.
+ *
+ * Postgres only accepts `PARTITION BY` on `CREATE TABLE`. drizzle-kit has already
+ * emitted a normal `CREATE TABLE`, so `generate` writes a migration that recreates
+ * that table when it is empty and refuses to run once it has rows. The table stays
+ * in the Drizzle schema; this package does not emit a second copy of the column list.
+ */
+export function partitionedTable<TTable extends PgTable>(
+  table: TTable,
+  config: {
+    method: PartitionMethod;
+    columns: readonly TTable["_"]["columns"][keyof TTable["_"]["columns"]][];
+  },
+): PartitionedTable;
+export function partitionedTable(
+  table: { name: string; schema?: string },
+  config: { method: PartitionMethod; columns: readonly string[] },
+): PartitionedTable;
+export function partitionedTable(
+  table: PgTable | { name: string; schema?: string },
+  config: { method: PartitionMethod; columns: readonly (AnyPgColumn | string)[] },
+): PartitionedTable {
+  if (!PARTITION_METHODS.has(config.method)) {
+    throw new PgExtrasError('partitionedTable(): method must be "range", "list", or "hash"');
+  }
+  if (!config.columns || config.columns.length === 0) {
+    throw new PgExtrasError("partitionedTable(): columns must include the partition key");
+  }
+  if (is(table, PgTable)) {
+    const seen = new Set<string>();
+    const columns: AnyPgColumn[] = [];
+    for (const column of config.columns) {
+      if (typeof column === "string") {
+        throw new PgExtrasError("partitionedTable(): pass columns from the Drizzle table, not name strings");
+      }
+      assertColumnOfTable(table, column);
+      if (seen.has(column.name)) {
+        throw new PgExtrasError(`partitionedTable(${getTableConfig(table).name}): duplicate partition column "${column.name}"`);
+      }
+      seen.add(column.name);
+      columns.push(column);
+    }
+    assertKeyCoveredByUniques(table, columns);
+  } else {
+    assertIdentifier("table", table.name);
+    if (table.schema) assertIdentifier("table schema", table.schema);
+    const seen = new Set<string>();
+    for (const column of config.columns) {
+      if (typeof column !== "string") {
+        throw new PgExtrasError("partitionedTable(): columns of a { name, schema } table must be database column name strings");
+      }
+      assertIdentifier("partition column", column);
+      if (seen.has(column)) throw new PgExtrasError(`partitionedTable(${table.name}): duplicate partition column "${column}"`);
+      seen.add(column);
+    }
+  }
+  return brand(
+    {
+      table,
+      method: config.method,
+      columns: [...config.columns],
+    },
+    "partitionedTable",
+  );
+}
+
+type PartitionInput = {
+  parent: PartitionParent;
+  schema?: string;
+  onRemove?: "drop" | "detach";
+  from?: readonly PartitionBound[];
+  to?: readonly PartitionBound[];
+  in?: readonly (PartitionBound | readonly PartitionBound[])[];
+  modulus?: number;
+  remainder?: number;
+  default?: boolean;
+};
+
+/**
+ * A child table created with `CREATE TABLE ... PARTITION OF`.
+ * `onRemove` defaults to `"drop"`: removing the declaration drops the child when it is empty.
+ */
+export function pgPartition(
+  name: string,
+  config: { parent: PartitionParent; schema?: string; onRemove?: "drop" | "detach"; from: readonly PartitionBound[]; to: readonly PartitionBound[] },
+): PgPartition;
+export function pgPartition(
+  name: string,
+  config: {
+    parent: PartitionParent;
+    schema?: string;
+    onRemove?: "drop" | "detach";
+    in: readonly (PartitionBound | readonly PartitionBound[])[];
+  },
+): PgPartition;
+export function pgPartition(
+  name: string,
+  config: { parent: PartitionParent; schema?: string; onRemove?: "drop" | "detach"; modulus: number; remainder: number },
+): PgPartition;
+export function pgPartition(
+  name: string,
+  config: { parent: PartitionParent; schema?: string; onRemove?: "drop" | "detach"; default: true },
+): PgPartition;
+export function pgPartition(name: string, config: PartitionInput): PgPartition {
+  assertIdentifier("partition", name);
+  if (config.schema) assertIdentifier("partition schema", config.schema);
+  const onRemove = config.onRemove ?? "drop";
+  if (onRemove !== "drop" && onRemove !== "detach") {
+    throw new PgExtrasError(`pgPartition("${name}"): onRemove must be "drop" or "detach"`);
+  }
+  return brand(
+    {
+      name,
+      schema: config.schema ?? null,
+      parent: requireParent(config.parent, `pgPartition("${name}")`),
+      mode: "create",
+      onRemove,
+      bound: readBound(`pgPartition("${name}")`, config),
+    },
+    "partition",
+  );
+}
+
+/**
+ * Attach a table drizzle-kit already created. Removing the declaration detaches it and leaves the table in place.
+ * The table has to match the parent (column order, NOT NULL, unique indexes, and check constraints) or Postgres rejects ATTACH.
+ */
+export function pgAttachPartition(
+  table: PgTable,
+  config: { parent: PartitionParent; from: readonly PartitionBound[]; to: readonly PartitionBound[] },
+): PgPartition;
+export function pgAttachPartition(
+  table: PgTable,
+  config: { parent: PartitionParent; in: readonly (PartitionBound | readonly PartitionBound[])[] },
+): PgPartition;
+export function pgAttachPartition(
+  table: PgTable,
+  config: { parent: PartitionParent; modulus: number; remainder: number },
+): PgPartition;
+export function pgAttachPartition(table: PgTable, config: { parent: PartitionParent; default: true }): PgPartition;
+export function pgAttachPartition(
+  table: { name: string; schema?: string },
+  config: { parent: PartitionParent; from: readonly PartitionBound[]; to: readonly PartitionBound[] },
+): PgPartition;
+export function pgAttachPartition(
+  table: { name: string; schema?: string },
+  config: { parent: PartitionParent; in: readonly (PartitionBound | readonly PartitionBound[])[] },
+): PgPartition;
+export function pgAttachPartition(
+  table: { name: string; schema?: string },
+  config: { parent: PartitionParent; modulus: number; remainder: number },
+): PgPartition;
+export function pgAttachPartition(
+  table: { name: string; schema?: string },
+  config: { parent: PartitionParent; default: true },
+): PgPartition;
+export function pgAttachPartition(
+  table: PgTable | { name: string; schema?: string },
+  config: PartitionInput,
+): PgPartition {
+  const identity = tableIdentity(table);
+  return brand(
+    {
+      name: identity.name,
+      schema: identity.schema,
+      parent: requireParent(config.parent, `pgAttachPartition(${identity.name})`),
+      mode: "attach",
+      onRemove: "detach",
+      bound: readBound(`pgAttachPartition(${identity.name})`, config),
+    },
+    "partition",
+  );
+}
+
+/** Keep `table` detached from `parent`. Idempotent when it is not attached. */
+export function pgDetachPartition(
+  table: PgTable | { name: string; schema?: string },
+  config: { parent: PartitionParent },
+): PgDetach {
+  const identity = tableIdentity(table);
+  return brand(
+    {
+      table,
+      parent: requireParent(config.parent, `pgDetachPartition(${identity.name})`),
+    },
+    "detach",
+  );
+}
+
+function requireParent(parent: PartitionParent, where: string): PartitionParent {
+  if (extrasKind(parent) === "partitionedTable") return parent;
+  if (is(parent, PgTable) || isPlainTableRef(parent)) return parent;
+  throw new PgExtrasError(`${where}: parent must be a Drizzle table, partitionedTable(), or { name, schema }`);
+}
+
+function isPlainTableRef(value: unknown): value is { name: string; schema?: string } {
+  if (!isPlainRecord(value) || typeof value.name !== "string") return false;
+  assertIdentifier("table", value.name);
+  if (value.schema !== undefined) {
+    if (typeof value.schema !== "string") return false;
+    assertIdentifier("table schema", value.schema);
+  }
+  return true;
+}
+
+function readBound(label: string, config: PartitionInput): PartitionBoundSpec {
+  const range = config.from !== undefined || config.to !== undefined;
+  const list = config.in !== undefined;
+  const hash = config.modulus !== undefined || config.remainder !== undefined;
+  const isDefault = config.default === true;
+  const selected = [range, list, hash, isDefault].filter(Boolean).length;
+  if (config.default !== undefined && config.default !== true) {
+    throw new PgExtrasError(`${label}: default must be true`);
+  }
+  if (selected !== 1) {
+    throw new PgExtrasError(`${label}: pass from/to, in, modulus/remainder, or default, and only one of those`);
+  }
+  if (range) {
+    if (!config.from || !config.to || config.from.length === 0 || config.to.length === 0) {
+      throw new PgExtrasError(`${label}: range bounds need from and to`);
+    }
+    if (config.from.length !== config.to.length) {
+      throw new PgExtrasError(`${label}: from and to must list one bound per partition column`);
+    }
+    return { kind: "range", from: [...config.from], to: [...config.to] };
+  }
+  if (list) {
+    if (!config.in || config.in.length === 0) {
+      throw new PgExtrasError(`${label}: in must list at least one value`);
+    }
+    return { kind: "list", values: config.in.map((value) => (Array.isArray(value) ? [...value] : value)) };
+  }
+  if (hash) {
+    if (!Number.isInteger(config.modulus) || config.modulus! < 1) {
+      throw new PgExtrasError(`${label}: modulus must be an integer >= 1`);
+    }
+    if (!Number.isInteger(config.remainder) || config.remainder! < 0 || config.remainder! >= config.modulus!) {
+      throw new PgExtrasError(`${label}: remainder must be an integer from 0 to modulus - 1`);
+    }
+    return { kind: "hash", modulus: config.modulus!, remainder: config.remainder! };
+  }
+  return { kind: "default" };
+}
+
+function assertKeyCoveredByUniques(table: PgTable, keyColumns: readonly AnyPgColumn[]): void {
+  const config = getTableConfig(table);
+  const keyNames = keyColumns.map((column) => column.name);
+  const groups: { label: string; names: string[] }[] = [];
+  const singlePk = config.columns.filter((column) => column.primary).map((column) => column.name);
+  if (singlePk.length > 0) groups.push({ label: "primary key", names: singlePk });
+  for (const pk of config.primaryKeys) {
+    groups.push({
+      label: pk.name ? `primary key "${pk.name}"` : "primary key",
+      names: pk.columns.map((column) => column.name),
+    });
+  }
+  for (const unique of config.uniqueConstraints) {
+    groups.push({
+      label: unique.name ? `unique constraint "${unique.name}"` : "unique constraint",
+      names: unique.columns.map((column) => column.name),
+    });
+  }
+  for (const column of config.columns) {
+    if (column.isUnique) groups.push({ label: `unique column "${column.name}"`, names: [column.name] });
+  }
+  for (const index of config.indexes) {
+    if (!index.config.unique) continue;
+    const names: string[] = [];
+    for (const column of index.config.columns) {
+      if (!is(column, Column)) {
+        const indexName = index.config.name ? ` "${index.config.name}"` : "";
+        throw new PgExtrasError(
+          `partitionedTable(${config.name}): unique index${indexName} includes an expression. Postgres requires every unique index on a partitioned table to include the partition key.`,
+        );
+      }
+      names.push(column.name);
+    }
+    groups.push({
+      label: index.config.name ? `unique index "${index.config.name}"` : "unique index",
+      names,
+    });
+  }
+  for (const group of groups) {
+    const missing = keyNames.filter((key) => !group.names.includes(key));
+    if (missing.length === 0) continue;
+    throw new PgExtrasError(
+      `partitionedTable(${config.name}): ${group.label} (${group.names.join(", ")}) must include partition key ${missing.map((key) => `"${key}"`).join(", ")}. Postgres requires every primary key and unique constraint on a partitioned table to include the partition key.`,
+    );
+  }
 }
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {

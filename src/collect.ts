@@ -3,15 +3,27 @@ import { PgTable } from "drizzle-orm/pg-core";
 import {
   extrasKind,
   isPlainRecord,
+  type PartitionedTable,
   type PgComment,
+  type PgDetach,
   type PgExtras,
   type PgExtension,
   type PgFunction,
+  type PgPartition,
   type PgTrigger,
 } from "./defs.js";
 
 export function collectExtras(modules: Record<string, unknown> | readonly Record<string, unknown>[]): PgExtras {
-  const extras: PgExtras = { functions: [], triggers: [], extensions: [], comments: [], tables: [] };
+  const extras: PgExtras = {
+    functions: [],
+    triggers: [],
+    extensions: [],
+    comments: [],
+    tables: [],
+    partitionedTables: [],
+    partitions: [],
+    detaches: [],
+  };
   const seen = new Set<unknown>();
   const list = Array.isArray(modules) ? modules : [modules];
   for (const mod of list) walk(mod, extras, seen);
@@ -30,6 +42,9 @@ export function defineExtras(input: {
   extensions?: readonly PgExtension[];
   comments?: readonly PgComment[];
   tables?: readonly PgTable[];
+  partitionedTables?: readonly PartitionedTable[];
+  partitions?: readonly PgPartition[];
+  detaches?: readonly PgDetach[];
 }): PgExtras {
   return collectExtras({
     functions: input.functions ?? [],
@@ -37,6 +52,9 @@ export function defineExtras(input: {
     extensions: input.extensions ?? [],
     comments: input.comments ?? [],
     tables: input.tables ?? [],
+    partitionedTables: input.partitionedTables ?? [],
+    partitions: input.partitions ?? [],
+    detaches: input.detaches ?? [],
   });
 }
 
@@ -61,6 +79,20 @@ function walk(value: unknown, extras: PgExtras, seen: Set<unknown>): void {
   }
   if (kind === "comment") {
     extras.comments.push(value as PgComment);
+    return;
+  }
+  if (kind === "partitionedTable") {
+    const partitioned = value as PartitionedTable;
+    extras.partitionedTables.push(partitioned);
+    if (is(partitioned.table, PgTable)) walk(partitioned.table, extras, seen);
+    return;
+  }
+  if (kind === "partition") {
+    extras.partitions.push(value as PgPartition);
+    return;
+  }
+  if (kind === "detach") {
+    extras.detaches.push(value as PgDetach);
     return;
   }
   if (is(value, PgTable)) {

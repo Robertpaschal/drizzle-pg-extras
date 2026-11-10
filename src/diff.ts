@@ -1,5 +1,13 @@
+import { PgExtrasError } from "./errors.js";
+import {
+  attachPartitionSql,
+  convertPartitionedTableSql,
+  createPartitionSql,
+  detachPartitionSql,
+  dropPartitionSql,
+} from "./partition-sql.js";
 import { quoteIdent, quoteLiteral } from "./quote.js";
-import type { CommentSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
+import type { CommentSnapshot, PartitionedTableSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
 import { sameFunction, sameTrigger } from "./snapshot.js";
 import {
   commentSql,
@@ -34,8 +42,19 @@ export function idempotentStatements(snapshot: Snapshot): string[] {
   if (sqlFunctions) statements.push("SET check_function_bodies = off");
   for (const fn of snapshot.functions) statements.push(createFunctionSql(fn));
   if (sqlFunctions) statements.push("SET check_function_bodies = on");
+  statements.push(...partitionStatements(snapshot));
   for (const comment of snapshot.comments) statements.push(commentSql(comment, comment.text));
   for (const trigger of snapshot.triggers) statements.push(createTriggerSql(trigger));
+  return statements;
+}
+
+function partitionStatements(snapshot: Snapshot): string[] {
+  const statements: string[] = [];
+  for (const parent of snapshot.partitionedTables) statements.push(convertPartitionedTableSql(parent, "partition"));
+  for (const partition of snapshot.partitions) {
+    statements.push(partition.mode === "attach" ? attachPartitionSql(partition) : createPartitionSql(partition));
+  }
+  for (const detach of snapshot.detaches) statements.push(detachPartitionSql(detach));
   return statements;
 }
 
@@ -67,6 +86,7 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
 
   const statements: string[] = [];
   for (const trigger of triggersToDrop) statements.push(dropTriggerSql(trigger));
+  statements.push(...partitionChanges(from, to, skipDroppedTables));
 
   const fnIds = [...dropFnIds].sort();
   for (const id of fnIds) statements.push(dropFunctionSql(fromFns.get(id)!));
@@ -120,6 +140,80 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
   }
 
   return statements;
+}
+
+function partitionChanges(from: Snapshot, to: Snapshot, skipDroppedTables: boolean): string[] {
+  const statements: string[] = [];
+  const handled = new Set<string>();
+  const fromParents = new Map(from.partitionedTables.map((item) => [item.id, item]));
+  const toParents = new Map(to.partitionedTables.map((item) => [item.id, item]));
+  const fromPartitions = new Map(from.partitions.map((item) => [item.id, item]));
+  const toPartitions = new Map(to.partitions.map((item) => [item.id, item]));
+  const fromDetaches = new Set(from.detaches.map((item) => item.id));
+
+  for (const partition of from.partitions) {
+    if (toPartitions.has(partition.id)) continue;
+    if (
+      skipDroppedTables &&
+      (tableGone(from, to, partition.parentSchema, partition.parentName) || tableGone(from, to, partition.schema, partition.name))
+    ) {
+      continue;
+    }
+    if (partition.mode === "attach" || partition.onRemove === "detach") statements.push(detachPartitionSql(partition));
+    else statements.push(dropPartitionSql(partition));
+    handled.add(childKey(partition.schema, partition.name, partition.parentSchema, partition.parentName));
+  }
+
+  for (const parent of from.partitionedTables) {
+    if (toParents.has(parent.id)) continue;
+    if (skipDroppedTables && tableGone(from, to, parent.schema, parent.name)) continue;
+    statements.push(convertPartitionedTableSql(parent, "unpartition"));
+  }
+
+  for (const parent of to.partitionedTables) {
+    const previous = fromParents.get(parent.id);
+    if (!previous) {
+      statements.push(convertPartitionedTableSql(parent, "partition"));
+      continue;
+    }
+    if (previous.method !== parent.method || previous.columns.join("\0") !== parent.columns.join("\0")) {
+      throw new PgExtrasError(
+        `partitioned table ${parent.schema}.${parent.name} changed from ${describeKey(previous)} to ${describeKey(parent)}. Postgres cannot change a partition key in place. Keep the original partitionedTable() and move the data in a custom migration if you need a different key.`,
+      );
+    }
+  }
+
+  for (const partition of to.partitions) {
+    const previous = fromPartitions.get(partition.id);
+    if (!previous) {
+      statements.push(partition.mode === "attach" ? attachPartitionSql(partition) : createPartitionSql(partition));
+      continue;
+    }
+    if (previous.mode !== partition.mode || previous.boundSql !== partition.boundSql || previous.boundKind !== partition.boundKind) {
+      throw new PgExtrasError(
+        `partition ${partition.schema}.${partition.name} of ${partition.parentSchema}.${partition.parentName} changed (${previous.mode} ${previous.boundSql} -> ${partition.mode} ${partition.boundSql}). Postgres cannot alter partition bounds in place, and this package will not detach and recreate a partition because that drops rows. Move the rows in a custom migration.`,
+      );
+    }
+  }
+
+  for (const detach of to.detaches) {
+    if (fromDetaches.has(detach.id)) continue;
+    if (handled.has(childKey(detach.schema, detach.name, detach.parentSchema, detach.parentName))) continue;
+    if (skipDroppedTables && (tableGone(from, to, detach.parentSchema, detach.parentName) || tableGone(from, to, detach.schema, detach.name))) {
+      continue;
+    }
+    statements.push(detachPartitionSql(detach));
+  }
+
+  return statements;
+}
+
+function childKey(schema: string, name: string, parentSchema: string, parentName: string): string {
+  return JSON.stringify([schema, name, parentSchema, parentName]);
+}
+
+function describeKey(parent: PartitionedTableSnapshot): string {
+  return `${parent.method.toUpperCase()} (${parent.columns.join(", ")})`;
 }
 
 function tableGone(from: Snapshot, to: Snapshot, schema: string, table: string): boolean {

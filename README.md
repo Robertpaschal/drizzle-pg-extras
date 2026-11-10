@@ -1,6 +1,6 @@
 # drizzle-pg-extras
 
-Declare the Postgres objects Drizzle still can't model — functions, triggers, table and column comments, and extensions — in TypeScript next to your Drizzle tables, and turn them into ordinary SQL migration files.
+Declare the Postgres objects Drizzle still can't model — functions, triggers, table and column comments, extensions, and partitioned tables — in TypeScript next to your Drizzle tables, and turn them into ordinary SQL migration files.
 
 `drizzle-kit migrate` applies those files. This package does not patch Drizzle. If Drizzle later generates the same objects itself, the SQL you already committed stays valid.
 
@@ -13,9 +13,9 @@ These are open Drizzle requests, and the v1.0.0-rc.5 notes don't add them. [PR #
 | `CREATE FUNCTION` / `CREATE TRIGGER` | [drizzle-orm#843](https://github.com/drizzle-team/drizzle-orm/issues/843) |
 | `COMMENT ON` table and column | [drizzle-orm#886](https://github.com/drizzle-team/drizzle-orm/issues/886) |
 | `CREATE EXTENSION` | [drizzle-orm#2124](https://github.com/drizzle-team/drizzle-orm/issues/2124) |
-| Partitioned tables | [drizzle-orm#2854](https://github.com/drizzle-team/drizzle-orm/issues/2854) — not in this version |
+| Partitioned tables | [drizzle-orm#2854](https://github.com/drizzle-team/drizzle-orm/issues/2854) |
 
-Smaller packages already cover one of those pieces each: [`drizzle-triggers`](https://github.com/RagedPanda/drizzle-triggers), [`@onozaty/drizzle-db-comments-generator`](https://github.com/onozaty/drizzle-db-comments-generator), and [`drizzle-partition`](https://github.com/Rezarys/drizzle-partition). This package is the Postgres slice people keep asking to put in one schema: functions, triggers, comments, and extensions.
+Smaller packages already cover one of those pieces each: [`drizzle-triggers`](https://github.com/RagedPanda/drizzle-triggers), [`@onozaty/drizzle-db-comments-generator`](https://github.com/onozaty/drizzle-db-comments-generator), and [`drizzle-partition`](https://github.com/Rezarys/drizzle-partition). This package is the Postgres slice people keep asking to put in one schema: functions, triggers, comments, extensions, and partitions. `drizzle-partition` rewrites the `CREATE TABLE` drizzle-kit already wrote. This package leaves that file alone and appends a migration. See [Partitioning](#partitioning).
 
 ## Example
 
@@ -130,6 +130,10 @@ console.log(renderIdempotent(extras));
 | `pgExtension(name, { schema, version, cascade })` | `CREATE EXTENSION IF NOT EXISTS`, optionally `WITH SCHEMA` and `VERSION`. |
 | `withComment(target, text)` | Table, or a column builder such as `text("email")`. Returns the same object. Does not change Drizzle's SQL. |
 | `commentOn(tableOrColumn, text)` | Same `COMMENT ON` output, for a column that already belongs to a table. |
+| `partitionedTable(table, { method, columns })` | Marks a drizzle-kit table as `RANGE`, `LIST`, or `HASH`. The migration converts the empty table. See [Partitioning](#partitioning). |
+| `pgPartition(name, { parent, ...bounds })` | `CREATE TABLE ... PARTITION OF`. Bounds are `from`/`to`, `in`, `modulus`/`remainder`, or `default: true`. |
+| `pgAttachPartition(table, { parent, ...bounds })` | `ALTER TABLE ... ATTACH PARTITION` for a table drizzle-kit already created. |
+| `pgDetachPartition(table, { parent })` | `ALTER TABLE ... DETACH PARTITION`. The table is kept. |
 | `defineExtras` / `collectExtras` | Bundle objects, or scan a module's exports (the CLI does the scan). |
 | `generate` / `diffSnapshots` / `snapshotExtras` | Diff against the stored snapshot and write files. |
 | `renderIdempotent` | Create-or-replace script for everything currently declared. No drops. |
@@ -140,11 +144,90 @@ A function's identity is `schema.name(arg types)`. Two overloads can coexist. A 
 
 Comments that disappear become `COMMENT … IS NULL`. If the table or column also left the schema, the drop is omitted: the table migration drops the comment with the column. Removing a column that a trigger's `UPDATE OF` or `WHEN` still references takes two generates: change the trigger first, then drop the column. Postgres will not drop the column while the trigger depends on it.
 
+## Partitioning
+
+Postgres accepts `PARTITION BY` only on `CREATE TABLE`. There is no `ALTER TABLE ... PARTITION BY`. drizzle-kit has already written a normal `CREATE TABLE` by the time this package runs, and this package does not rewrite that file (that is what `drizzle-partition` does).
+
+`partitionedTable()` takes the other road. You keep the table in the Drizzle schema, so drizzle-kit still owns columns, indexes, and foreign keys. `generate` appends a migration that rebuilds the table as partitioned **when it is empty**, and raises when it has any rows. Run `drizzle-kit generate` first, then `drizzle-pg-extras generate`, then `drizzle-kit migrate`, and load data after that. Doing it in one `drizzle-kit migrate` is the normal case: kit creates the empty table, then this migration converts it, before the application writes rows.
+
+The tradeoff is that conversion is a rebuild, not a flag. It is safe on an empty table and refused on a table that already has data. A helper that emitted the parent `CREATE TABLE` itself would avoid the rebuild, but then the table would have to stay out of drizzle-kit or kit would create it a second time, and this package would have to own later column changes. Keeping the table in the Drizzle schema is the point of fitting the rest of this package.
+
+```ts
+import { integer, pgTable, serial, text, timestamp, primaryKey } from "drizzle-orm/pg-core";
+import { partitionedTable, pgAttachPartition, pgPartition } from "drizzle-pg-extras";
+
+export const events = pgTable("events", {
+  id: serial("id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  region: text("region").notNull(),
+  payload: text("payload").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.id, t.createdAt] }),
+]);
+
+export const eventsByTime = partitionedTable(events, {
+  method: "range", // "list" or "hash"
+  columns: [events.createdAt],
+});
+
+export const events2024 = pgPartition("events_2024", {
+  parent: events,
+  from: ["2024-01-01"],
+  to: ["2025-01-01"],
+});
+
+export const eventsDefault = pgPartition("events_default", {
+  parent: events,
+  default: true,
+});
+
+export const eventsArchive = pgTable("events_archive", {
+  id: integer("id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  region: text("region").notNull(),
+  payload: text("payload").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.id, t.createdAt] }),
+]);
+
+export const attachArchive = pgAttachPartition(eventsArchive, {
+  parent: events,
+  from: ["2020-01-01"],
+  to: ["2024-01-01"],
+});
+
+// Later, instead of attachArchive:
+// export const detachArchive = pgDetachPartition(eventsArchive, { parent: events });
+```
+
+`pgPartition` creates a child with `CREATE TABLE ... PARTITION OF`. List bounds use `in: ["en", "en-US"]` (a tuple per row when the key has several columns). Hash bounds use `modulus` and `remainder`. `from: ["MINVALUE"]` and `to: ["MAXVALUE"]` are the range keywords, not strings. Export `partitionedTable()` as well as the children. The CLI only sees what the schema module exports.
+
+Every primary key and unique constraint on a Drizzle table has to include the partition columns. Postgres requires that, and `partitionedTable()` rejects the table when one does not. A `{ name, schema }` parent skips that check because the columns are only strings.
+
+Removing a `pgPartition` drops the child when the child is empty. `onRemove: "detach"` keeps the table and its rows instead. `pgAttachPartition` always detaches on remove, because drizzle-kit still owns that table. `pgDetachPartition` is the explicit form of that detach. Set `onRemove` when you declare the partition. It is written into `_pg-extras.json` the next time a migration is generated. Changing only `onRemove` does not write a migration file.
+
+The statements are idempotent. Running the migration twice is a no-op when the parent is already partitioned the same way and the children are already attached. `renderIdempotent` emits the same create-or-attach script and does not drop partitions you removed from the schema.
+
+The conversion copies columns, defaults, identity, indexes, checks, and column comments with `CREATE TABLE ... (LIKE ... INCLUDING ALL)`, then puts back outgoing and incoming foreign keys, triggers, row level security policies, grants, the table comment, and ownership. `serial` sequences are reassigned with `ALTER SEQUENCE ... OWNED BY` before the old table is dropped, so `nextval` keeps working. Index and constraint names are renamed back to the names drizzle-kit recorded. A later `drizzle-kit generate` still diffs your tables and reports no schema changes.
+
+### Partition limits
+
+- Empty parents only. A table that already has rows is not converted. Move those rows yourself.
+- The partition key cannot be changed in place. `generate` throws. It also throws when a child bound changes. Recreating a partition would drop its rows, and this package will not do that quietly. Detach, copy, and attach in a migration you write.
+- Hash parents cannot have a `DEFAULT` partition. Postgres rejects it.
+- A table you attach has to match the parent already: column order, `NOT NULL`, unique indexes, and check constraints. Postgres checks that at `ATTACH` and the error is Postgres's.
+- Views and materialized views that depend on the parent are not rewritten. The migration raises and leaves the table in place. Drop the views first.
+- No expression keys such as `PARTITION BY RANGE (date_trunc('month', created_at))`, no sub-partitions, and no tablespaces.
+- No `DETACH PARTITION CONCURRENTLY`. `drizzle-kit migrate` runs each migration in a transaction, and `CONCURRENTLY` cannot run there.
+- `drizzle-kit push` does not read these definitions. Partition children are real tables kit did not declare, so push can offer to drop them. The supported path is generate, then migrate. If you push anyway, exclude the children with `tablesFilter`.
+- A later drizzle-kit migration that drops and recreates the parent (some column type changes) drops the partitions with it. The extras snapshot already says the table is partitioned, so this package will not emit the conversion again. Repair that kit migration by hand.
+- Down SQL drops created partitions when they are empty, detaches attached tables, and converts the parent back when it is empty. It raises when a created partition still has rows. `drizzle-kit migrate` does not run the down file.
+
 ## drizzle-kit push
 
-`drizzle-kit push` does not read this package and does not run files in the migrations folder. It will not create functions, triggers, comments, or extensions.
+`drizzle-kit push` does not read this package and does not run files in the migrations folder. It will not create functions, triggers, comments, extensions, or partitions.
 
-Kit 0.31 has no trigger diff, so push does not drop a trigger it never declared. A push that drops or recreates the table still drops that table's triggers and comments, because Postgres drops them with the table. Functions are not attached to the table and stay. Extensions are not created. An extension that installs its own tables (PostGIS) can show up as relations push wants to delete; set `extensionsFilters: ["postgis"]` in `drizzle.config.ts` for that case.
+Kit 0.31 has no trigger diff, so push does not drop a trigger it never declared. A push that drops or recreates the table still drops that table's triggers and comments, because Postgres drops them with the table. Functions are not attached to the table and stay. Extensions are not created. An extension that installs its own tables (PostGIS) can show up as relations push wants to delete; set `extensionsFilters: ["postgis"]` in `drizzle.config.ts` for that case. Partition children show up the same way: they are tables in the database that are not in the Drizzle schema, and push can try to drop them. Exclude those names with `tablesFilter` if you push, or don't push.
 
 The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`, then `drizzle-kit migrate`. If you use push for tables, apply the extras yourself with `renderIdempotent` (or by running the latest up file) after a push that recreated a table.
 
@@ -152,7 +235,7 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 
 | | |
 | --- | --- |
-| drizzle-orm | `>=0.36.4`. Tested with 0.45.3. v1.0.0-rc.5 does not add functions, triggers, comments, extensions, or partitions. |
+| drizzle-orm | `>=0.36.4`. Tested with 0.45.3. Drizzle 0.45 and v1.0.0-rc.5 still do not generate functions, triggers, comments, extensions, or partitions. |
 | drizzle-kit | `>=0.31.0` journal format. Tested with 0.31.11: `migrate` applies the file, and the next `generate` reports no schema changes. |
 | drizzle-kit 1.0 rc | Writes a v1 folder when one is already present. Delta snapshots in rc.5 are not rewritten; treat that layout as untested beyond the file names. |
 | PostgreSQL | 14 or newer (`CREATE OR REPLACE TRIGGER`). Tested on 16. |
@@ -160,8 +243,7 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 
 ## What it does not do yet
 
-- Partitions (`PARTITION BY`, child tables). That is issue #2854 and is left for a later version. `drizzle-partition` rewrites kit's `CREATE TABLE` if you need it now.
-- Row level security policies. drizzle-kit already generates policies.
+- Row level security policies. drizzle-kit already generates policies. The partition conversion copies policies that already exist on a parent; it does not author new ones.
 - Views and materialized views.
 - Constraint triggers, deferrable triggers, and `REFERENCING` transition tables.
 - `OUT`, `INOUT`, and `VARIADIC` function arguments.
@@ -188,7 +270,7 @@ npm run typecheck
 npm run lint
 ```
 
-Unit tests cover SQL generation and the snapshot diff. `POSTGRES_URL` points the integration test at a real Postgres. It runs `drizzle-kit migrate`, checks that the trigger fires, that the comments and extension exist, and that the down file removes them. CI uses a Postgres 16 service container.
+Unit tests cover SQL generation and the snapshot diff, including partition bounds. `POSTGRES_URL` points the integration tests at a real Postgres. One runs `drizzle-kit migrate`, checks that the trigger fires, and that the comments and extension exist. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. CI uses a Postgres 16 service container.
 
 ## License
 

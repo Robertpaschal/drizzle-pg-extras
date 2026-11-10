@@ -6,9 +6,13 @@ import {
   extrasKind,
   readComment,
   tableIdentity,
+  type PartitionBound,
+  type PartitionedTable,
   type PgComment,
+  type PgDetach,
   type PgExtras,
   type PgFunction,
+  type PgPartition,
   type PgTrigger,
   type TriggerArg,
 } from "./defs.js";
@@ -75,12 +79,44 @@ export type InventoryTable = {
   columns: string[];
 };
 
+export type PartitionedTableSnapshot = {
+  id: string;
+  schema: string;
+  name: string;
+  method: "range" | "list" | "hash";
+  columns: string[];
+};
+
+export type PartitionSnapshot = {
+  id: string;
+  schema: string;
+  name: string;
+  parentSchema: string;
+  parentName: string;
+  mode: "create" | "attach";
+  onRemove: "drop" | "detach";
+  boundKind: "range" | "list" | "hash" | "default";
+  /** `DEFAULT` or a `FOR VALUES ...` clause, with literals already quoted. */
+  boundSql: string;
+};
+
+export type DetachSnapshot = {
+  id: string;
+  schema: string;
+  name: string;
+  parentSchema: string;
+  parentName: string;
+};
+
 export type Snapshot = {
   version: 1;
   functions: FunctionSnapshot[];
   triggers: TriggerSnapshot[];
   extensions: ExtensionSnapshot[];
   comments: CommentSnapshot[];
+  partitionedTables: PartitionedTableSnapshot[];
+  partitions: PartitionSnapshot[];
+  detaches: DetachSnapshot[];
   inventory: {
     scanned: boolean;
     tables: InventoryTable[];
@@ -94,6 +130,9 @@ export function emptySnapshot(): Snapshot {
     triggers: [],
     extensions: [],
     comments: [],
+    partitionedTables: [],
+    partitions: [],
+    detaches: [],
     inventory: { scanned: false, tables: [] },
   };
 }
@@ -164,10 +203,17 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
   });
   inventoryTables.sort((a, b) => `${a.schema}.${a.name}`.localeCompare(`${b.schema}.${b.name}`));
 
+  const partitionedTables = snapshotPartitionedTables(extras, nameOf);
+  const partitions = snapshotPartitions(extras, partitionedTables);
+  const detaches = snapshotDetaches(extras, partitions);
+
   functions.sort((a, b) => a.id.localeCompare(b.id));
   triggers.sort((a, b) => a.id.localeCompare(b.id));
   extensions.sort((a, b) => a.id.localeCompare(b.id));
   comments.sort((a, b) => a.id.localeCompare(b.id));
+  partitionedTables.sort((a, b) => a.id.localeCompare(b.id));
+  partitions.sort((a, b) => a.id.localeCompare(b.id));
+  detaches.sort((a, b) => a.id.localeCompare(b.id));
 
   const triggerIds = new Set<string>();
   for (const trigger of triggers) {
@@ -183,6 +229,9 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
     triggers,
     extensions,
     comments,
+    partitionedTables,
+    partitions,
+    detaches,
     inventory: { scanned: true, tables: inventoryTables },
   };
 }
@@ -468,6 +517,189 @@ export function parseSnapshot(value: unknown): Snapshot {
     triggers: record.triggers ?? [],
     extensions: record.extensions ?? [],
     comments: record.comments ?? [],
+    partitionedTables: record.partitionedTables ?? [],
+    partitions: record.partitions ?? [],
+    detaches: record.detaches ?? [],
     inventory: record.inventory ?? { scanned: false, tables: [] },
   };
+}
+
+function snapshotPartitionedTables(
+  extras: PgExtras,
+  nameOf: (column: AnyPgColumn) => string,
+): PartitionedTableSnapshot[] {
+  const tables: PartitionedTableSnapshot[] = [];
+  for (const table of extras.partitionedTables) {
+    const identity = tableIdentity(table.table);
+    const columns = table.columns.map((column) => (typeof column === "string" ? column : nameOf(column)));
+    const snap: PartitionedTableSnapshot = {
+      id: JSON.stringify(["partitioned", identity.schema, identity.name]),
+      schema: identity.schema,
+      name: identity.name,
+      method: table.method,
+      columns,
+    };
+    if (tables.some((item) => item.id === snap.id)) {
+      throw new PgExtrasError(`partitioned table ${identity.schema}.${identity.name} is declared more than once`);
+    }
+    tables.push(snap);
+  }
+  return tables;
+}
+
+function snapshotPartitions(extras: PgExtras, parents: readonly PartitionedTableSnapshot[]): PartitionSnapshot[] {
+  const partitions: PartitionSnapshot[] = [];
+  const childIds = new Set<string>();
+  const defaults = new Set<string>();
+  const hashSlots = new Set<string>();
+  for (const partition of extras.partitions) {
+    const parent = parentIdentity(partition);
+    const declared = parents.find((item) => item.schema === parent.schema && item.name === parent.name);
+    if (!declared) {
+      throw new PgExtrasError(
+        `partition "${partition.name}" refers to ${parent.schema}.${parent.name}, which has no partitionedTable(). Declare the parent as well`,
+      );
+    }
+    assertBoundMatches(partition, declared);
+    const schema = partition.schema ?? declared.schema;
+    const snap: PartitionSnapshot = {
+      id: JSON.stringify(["partition", declared.schema, declared.name, schema, partition.name]),
+      schema,
+      name: partition.name,
+      parentSchema: declared.schema,
+      parentName: declared.name,
+      mode: partition.mode,
+      onRemove: partition.onRemove,
+      boundKind: partition.bound.kind,
+      boundSql: boundSqlOf(partition, declared.columns.length),
+    };
+    if (partitions.some((item) => item.id === snap.id)) {
+      throw new PgExtrasError(`partition ${schema}.${partition.name} of ${declared.schema}.${declared.name} is declared more than once`);
+    }
+    const childId = JSON.stringify([schema, partition.name]);
+    if (childIds.has(childId)) {
+      throw new PgExtrasError(`table ${schema}.${partition.name} is declared as a partition more than once`);
+    }
+    childIds.add(childId);
+    if (partition.bound.kind === "default") {
+      const parentId = JSON.stringify([declared.schema, declared.name]);
+      if (defaults.has(parentId)) {
+        throw new PgExtrasError(`partitioned table ${declared.schema}.${declared.name} has more than one DEFAULT partition`);
+      }
+      defaults.add(parentId);
+    }
+    if (partition.bound.kind === "hash") {
+      const slot = JSON.stringify([declared.schema, declared.name, partition.bound.modulus, partition.bound.remainder]);
+      if (hashSlots.has(slot)) {
+        throw new PgExtrasError(
+          `partition ${schema}.${partition.name} repeats modulus ${partition.bound.modulus} remainder ${partition.bound.remainder}`,
+        );
+      }
+      hashSlots.add(slot);
+    }
+    partitions.push(snap);
+  }
+  return partitions;
+}
+
+function snapshotDetaches(extras: PgExtras, partitions: readonly PartitionSnapshot[]): DetachSnapshot[] {
+  const detaches: DetachSnapshot[] = [];
+  for (const detach of extras.detaches) {
+    const child = tableIdentity(detach.table);
+    const parent = parentIdentity(detach);
+    const snap: DetachSnapshot = {
+      id: JSON.stringify(["detach", parent.schema, parent.name, child.schema, child.name]),
+      schema: child.schema,
+      name: child.name,
+      parentSchema: parent.schema,
+      parentName: parent.name,
+    };
+    if (detaches.some((item) => item.id === snap.id)) {
+      throw new PgExtrasError(`detach of ${child.schema}.${child.name} from ${parent.schema}.${parent.name} is declared more than once`);
+    }
+    if (partitions.some((item) => item.schema === child.schema && item.name === child.name && item.parentSchema === parent.schema && item.parentName === parent.name)) {
+      throw new PgExtrasError(
+        `${child.schema}.${child.name} is both attached to and detached from ${parent.schema}.${parent.name}`,
+      );
+    }
+    detaches.push(snap);
+  }
+  return detaches;
+}
+
+function parentIdentity(value: PgPartition | PgDetach): { schema: string; name: string } {
+  const parent = value.parent;
+  if (extrasKind(parent) === "partitionedTable") return tableIdentity((parent as PartitionedTable).table);
+  return tableIdentity(parent as PgTable | { name: string; schema?: string });
+}
+
+function assertBoundMatches(partition: PgPartition, parent: PartitionedTableSnapshot): void {
+  const label = `partition "${partition.schema ?? parent.schema}.${partition.name}"`;
+  const kind = partition.bound.kind;
+  if (parent.method === "hash" && kind === "default") {
+    throw new PgExtrasError(`${label}: a hash-partitioned table cannot have a DEFAULT partition`);
+  }
+  if (parent.method === "range" && kind !== "range" && kind !== "default") {
+    throw new PgExtrasError(`${label}: ${parent.schema}.${parent.name} is partitioned by range, so use from/to or default`);
+  }
+  if (parent.method === "list" && kind !== "list" && kind !== "default") {
+    throw new PgExtrasError(`${label}: ${parent.schema}.${parent.name} is partitioned by list, so use in or default`);
+  }
+  if (parent.method === "hash" && kind !== "hash") {
+    throw new PgExtrasError(`${label}: ${parent.schema}.${parent.name} is partitioned by hash, so use modulus and remainder`);
+  }
+  if (kind === "range" && partition.bound.kind === "range" && partition.bound.from.length !== parent.columns.length) {
+    throw new PgExtrasError(
+      `${label}: from and to need ${parent.columns.length} bound(s) for (${parent.columns.join(", ")})`,
+    );
+  }
+}
+
+function boundSqlOf(partition: PgPartition, keyCount: number): string {
+  const label = `partition "${partition.name}"`;
+  const bound = partition.bound;
+  if (bound.kind === "default") return "DEFAULT";
+  if (bound.kind === "range") {
+    return `FOR VALUES FROM (${bound.from.map((value) => renderPartitionBound(value, "from")).join(", ")}) TO (${bound.to.map((value) => renderPartitionBound(value, "to")).join(", ")})`;
+  }
+  if (bound.kind === "list") {
+    const values = bound.values.map((value) => {
+      if (isBoundTuple(value)) {
+        if (value.length !== keyCount) {
+          throw new PgExtrasError(`${label}: each IN value needs ${keyCount} item(s), one per partition column`);
+        }
+        return `(${value.map((item) => renderPartitionBound(item, "list")).join(", ")})`;
+      }
+      if (keyCount !== 1) {
+        throw new PgExtrasError(`${label}: a ${keyCount}-column list partition needs tuples, such as in: [["a", 1]]`);
+      }
+      return renderPartitionBound(value, "list");
+    });
+    return `FOR VALUES IN (${values.join(", ")})`;
+  }
+  return `FOR VALUES WITH (MODULUS ${bound.modulus}, REMAINDER ${bound.remainder})`;
+}
+
+function isBoundTuple(value: PartitionBound | readonly PartitionBound[]): value is readonly PartitionBound[] {
+  return Array.isArray(value);
+}
+
+function renderPartitionBound(value: PartitionBound, side: "from" | "to" | "list"): string {
+  if (value === "MINVALUE") {
+    if (side !== "from") throw new PgExtrasError('MINVALUE is only valid in a range partition "from" bound');
+    return "MINVALUE";
+  }
+  if (value === "MAXVALUE") {
+    if (side !== "to") throw new PgExtrasError('MAXVALUE is only valid in a range partition "to" bound');
+    return "MAXVALUE";
+  }
+  if (typeof value === "string") return quoteLiteral(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new PgExtrasError("partition bound must be a finite number");
+    return String(value);
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  if (value === null) return "NULL";
+  throw new PgExtrasError("partition bound must be a string, number, boolean, null, bigint, MINVALUE, or MAXVALUE");
 }

@@ -8,6 +8,10 @@ export {
   withComment,
   commentOn,
   readComment,
+  partitionedTable,
+  pgPartition,
+  pgAttachPartition,
+  pgDetachPartition,
   type PgFunction,
   type PgFunctionArg,
   type PgFunctionConfig,
@@ -15,6 +19,13 @@ export {
   type PgExtension,
   type PgComment,
   type PgExtras,
+  type PartitionedTable,
+  type PgPartition,
+  type PgDetach,
+  type PartitionMethod,
+  type PartitionBound,
+  type PartitionBoundSpec,
+  type PartitionParent,
   type PgLanguage,
   type PgVolatility,
   type PgSecurity,
@@ -35,6 +46,9 @@ export {
   type TriggerSnapshot,
   type ExtensionSnapshot,
   type CommentSnapshot,
+  type PartitionedTableSnapshot,
+  type PartitionSnapshot,
+  type DetachSnapshot,
 } from "./snapshot.js";
 export { diffSnapshots, idempotentStatements, type SqlDiff } from "./diff.js";
 export {
@@ -56,3 +70,10 @@ export {
   dropExtensionSql,
   commentSql,
 } from "./statements.js";
+export {
+  convertPartitionedTableSql,
+  createPartitionSql,
+  attachPartitionSql,
+  detachPartitionSql,
+  dropPartitionSql,
+} from "./partition-sql.js";
