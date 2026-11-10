@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 22]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: extras
+          POSTGRES_PASSWORD: extras
+          POSTGRES_DB: drizzle_pg_extras
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U extras -d drizzle_pg_extras"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+        env:
+          POSTGRES_URL: postgres://extras:extras@localhost:5432/drizzle_pg_extras

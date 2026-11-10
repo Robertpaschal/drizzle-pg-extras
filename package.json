@@ -1,0 +1,82 @@
+{
+  "name": "drizzle-pg-extras",
+  "version": "0.1.0",
+  "description": "Declare Postgres functions, triggers, comments, and extensions next to a Drizzle schema and generate SQL migrations.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Robertpaschal/drizzle-pg-extras.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Robertpaschal/drizzle-pg-extras/issues"
+  },
+  "homepage": "https://github.com/Robertpaschal/drizzle-pg-extras#readme",
+  "keywords": [
+    "drizzle",
+    "drizzle-orm",
+    "postgres",
+    "postgresql",
+    "migrations",
+    "triggers",
+    "functions"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "drizzle-pg-extras": "./dist/cli.js"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "drizzle-kit": ">=0.31.0",
+    "drizzle-orm": ">=0.36.4"
+  },
+  "peerDependenciesMeta": {
+    "drizzle-kit": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "jiti": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.1",
+    "@types/pg": "^8.15.6",
+    "drizzle-kit": "^0.31.11",
+    "drizzle-orm": "^0.45.3",
+    "eslint": "^9.39.1",
+    "pg": "^8.16.3",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.3",
+    "vitest": "^3.2.4"
+  }
+}
