@@ -104,7 +104,7 @@ function fail(error: unknown): number {
 function printHelp(): void {
   console.log(`drizzle-pg-extras ${commandList()}
 
-  generate   Write a drizzle-kit migration for functions, triggers, comments, and extensions that changed
+  generate   Write a drizzle-kit migration for functions, triggers, comments, extensions, and partitions that changed
   check      Exit 1 when those definitions changed and no migration was written
 
   --config, -c <file>   drizzle config. Defaults to drizzle.config.ts
