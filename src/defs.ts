@@ -7,7 +7,29 @@ import {
   type ColumnBuilderBase,
   type SQL,
 } from "drizzle-orm";
-import { getTableConfig, PgTable, type AnyPgColumn } from "drizzle-orm/pg-core";
+import {
+  CheckBuilder,
+  ForeignKeyBuilder,
+  IndexBuilder,
+  IndexBuilderOn,
+  ManualMaterializedViewBuilder,
+  ManualViewBuilder,
+  MaterializedViewBuilder,
+  PgTable,
+  PrimaryKeyBuilder,
+  UniqueConstraintBuilder,
+  UniqueOnConstraintBuilder,
+  ViewBuilder,
+  getTableConfig,
+  isPgEnum,
+  isPgMaterializedView,
+  isPgView,
+  type AnyPgColumn,
+  type PgEnum,
+  type PgEnumObject,
+  type PgMaterializedView,
+  type PgView,
+} from "drizzle-orm/pg-core";
 import { PgExtrasError } from "./errors.js";
 import { assertIdentifier } from "./quote.js";
 
@@ -112,9 +134,30 @@ export type PgExtension = {
   readonly cascade: boolean;
 };
 
+/**
+ * Either `pgEnum` form. A structural type so a specific `pgEnum("role", ["a"])`
+ * still assigns; Drizzle's enum generics are invariant.
+ */
+export type AnyPgEnum = {
+  readonly enumName: string;
+  readonly enumValues: readonly string[];
+  readonly schema?: string;
+};
+
+export type PgViewLike = PgView | PgMaterializedView;
+
+export type PgCommentTarget =
+  | PgTable
+  | AnyPgColumn
+  | AnyPgEnum
+  | PgViewLike
+  | PgFunction
+  | PgTrigger
+  | PgExtension;
+
 export type PgComment = {
   readonly [KIND]: "comment";
-  readonly target: PgTable | AnyPgColumn;
+  readonly target: PgCommentTarget;
   readonly text: string;
 };
 
@@ -161,6 +204,8 @@ export type PgExtras = {
   extensions: PgExtension[];
   comments: PgComment[];
   tables: PgTable[];
+  enums: AnyPgEnum[];
+  views: PgViewLike[];
   partitionedTables: PartitionedTable[];
   partitions: PgPartition[];
   detaches: PgDetach[];
@@ -207,29 +252,87 @@ function stampConfig(target: object, comment: string): void {
 }
 
 /**
- * Attach a Postgres comment to a Drizzle table or column builder and return it unchanged.
- * Column comments are stored on the builder config object Drizzle copies onto the built column,
- * so query building and `drizzle-kit` diffs are unchanged.
+ * Attach a Postgres comment and return the same object.
+ * Column comments are stored on the builder config Drizzle copies onto the built column,
+ * so query building and `drizzle-kit` diffs are unchanged. The same is true for indexes
+ * and constraints: the comment lives on the builder, which the table callback creates
+ * again each time drizzle-kit reads the schema.
  *
- * Wrap the column builder (`text("email")`), not a column already read back off the table.
- * For an existing column, use {@link commentOn}.
+ * Wrap a column builder (`text("email")`), not a column already read back off the table.
+ * For an existing column, enum, view, function, trigger, or extension, use {@link commentOn}.
+ * Call `.as()` or `.existing()` before commenting a view, and `.on()` before commenting an index or unique constraint.
  */
 export function withComment<T extends Table>(target: T, comment: string): T;
 export function withComment<T extends ColumnBuilderBase>(target: T, comment: string): T;
 export function withComment<T extends Column>(target: T, comment: string): T;
+export function withComment<T extends PgEnum<[string, ...string[]]>>(target: T, comment: string): T;
+export function withComment<T extends PgEnumObject<object>>(target: T, comment: string): T;
+export function withComment<T extends PgView>(target: T, comment: string): T;
+export function withComment<T extends PgMaterializedView>(target: T, comment: string): T;
+export function withComment<T extends PgFunction>(target: T, comment: string): T;
+export function withComment<T extends PgTrigger>(target: T, comment: string): T;
+export function withComment<T extends PgExtension>(target: T, comment: string): T;
+export function withComment<T extends IndexBuilder>(target: T, comment: string): T;
+export function withComment<T extends UniqueConstraintBuilder>(target: T, comment: string): T;
+export function withComment<T extends CheckBuilder>(target: T, comment: string): T;
+export function withComment<T extends ForeignKeyBuilder>(target: T, comment: string): T;
+export function withComment<T extends PrimaryKeyBuilder>(target: T, comment: string): T;
 export function withComment(target: unknown, comment: string): unknown {
   const text = requireComment(comment, "withComment()");
   if (is(target, Table)) {
-    (target as unknown as Record<symbol, unknown>)[COMMENT] = text;
+    stampDirect(target, text);
     return target;
   }
   if (is(target, Column) || is(target, ColumnBuilder)) {
-    stampConfig(target as object, text);
+    stampConfig(target, text);
     return target;
   }
+  if (isEnumTarget(target) || isPgView(target) || isPgMaterializedView(target)) {
+    stampDirect(target, text);
+    return target;
+  }
+  const kind = extrasKind(target);
+  if (kind === "function" || kind === "trigger" || kind === "extension") {
+    stampDirect(target as object, text);
+    return target;
+  }
+  if (
+    is(target, IndexBuilder) ||
+    is(target, UniqueConstraintBuilder) ||
+    is(target, CheckBuilder) ||
+    is(target, ForeignKeyBuilder) ||
+    is(target, PrimaryKeyBuilder)
+  ) {
+    stampDirect(target, text);
+    return target;
+  }
+  if (is(target, IndexBuilderOn) || is(target, UniqueOnConstraintBuilder)) {
+    throw new PgExtrasError('withComment() on an index or unique constraint needs .on(...) first');
+  }
+  if (
+    is(target, ViewBuilder) ||
+    is(target, ManualViewBuilder) ||
+    is(target, MaterializedViewBuilder) ||
+    is(target, ManualMaterializedViewBuilder)
+  ) {
+    throw new PgExtrasError("withComment() on a view needs .as() or .existing() first");
+  }
   throw new PgExtrasError(
-    'withComment() takes a Drizzle table or a column builder such as text("email"). Enum comments are not in v0.1. For a column that already belongs to a table, use commentOn().',
+    'withComment() takes a table, column, enum, view, materialized view, function, trigger, extension, index, or constraint. For a column that already belongs to a table, use commentOn().',
   );
+}
+
+function stampDirect(target: object, text: string): void {
+  Object.defineProperty(target, COMMENT, {
+    value: text,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+}
+
+function isEnumTarget(target: unknown): target is AnyPgEnum {
+  return isPgEnum(target);
 }
 
 export function readComment(target: object): string | undefined {
@@ -460,15 +563,47 @@ export function pgExtension(
   );
 }
 
-/** A table or column comment that is not attached with {@link withComment}. */
+/**
+ * A comment that is not attached with {@link withComment}.
+ * Indexes and constraints are recreated whenever the table config runs, so comment those
+ * with `withComment` on the builder inside the extra-config callback.
+ */
 export function commentOn(target: PgTable, text: string): PgComment;
 export function commentOn(target: AnyPgColumn, text: string): PgComment;
-export function commentOn(target: PgTable | AnyPgColumn, text: string): PgComment {
+export function commentOn<TValues extends [string, ...string[]]>(target: PgEnum<TValues>, text: string): PgComment;
+export function commentOn<TValues extends object>(target: PgEnumObject<TValues>, text: string): PgComment;
+export function commentOn(target: PgView, text: string): PgComment;
+export function commentOn(target: PgMaterializedView, text: string): PgComment;
+export function commentOn(target: PgFunction, text: string): PgComment;
+export function commentOn(target: PgTrigger, text: string): PgComment;
+export function commentOn(target: PgExtension, text: string): PgComment;
+export function commentOn(target: PgCommentTarget, text: string): PgComment {
   const comment = requireComment(text, "commentOn()");
-  if (!is(target, PgTable) && !is(target, Column)) {
-    throw new PgExtrasError("commentOn() takes a Drizzle Postgres table or column");
+  if (isCommentTarget(target)) {
+    return brand({ target, text: comment }, "comment");
   }
-  return brand({ target: target as PgTable | AnyPgColumn, text: comment }, "comment");
+  if (
+    is(target, IndexBuilder) ||
+    is(target, IndexBuilderOn) ||
+    is(target, UniqueConstraintBuilder) ||
+    is(target, UniqueOnConstraintBuilder) ||
+    is(target, CheckBuilder) ||
+    is(target, ForeignKeyBuilder) ||
+    is(target, PrimaryKeyBuilder)
+  ) {
+    throw new PgExtrasError(
+      "commentOn() does not take an index or constraint. Wrap the builder with withComment() inside the table extra config.",
+    );
+  }
+  throw new PgExtrasError("commentOn() takes a table, column, enum, view, materialized view, function, trigger, or extension");
+}
+
+function isCommentTarget(target: unknown): target is PgCommentTarget {
+  if (is(target, PgTable) || is(target, Column)) return true;
+  if (isEnumTarget(target)) return true;
+  if (isPgView(target) || isPgMaterializedView(target)) return true;
+  const kind = extrasKind(target);
+  return kind === "function" || kind === "trigger" || kind === "extension";
 }
 
 export function assertColumnOfTable(table: PgTable, column: AnyPgColumn): void {

@@ -1,6 +1,6 @@
 # drizzle-pg-extras
 
-Declare the Postgres objects Drizzle still can't model — functions, triggers, table and column comments, extensions, and partitioned tables — in TypeScript next to your Drizzle tables, and turn them into ordinary SQL migration files.
+Declare the Postgres objects Drizzle still can't model — functions, triggers, comments, extensions, and partitioned tables — in TypeScript next to your Drizzle tables, and turn them into ordinary SQL migration files.
 
 `drizzle-kit migrate` applies those files. This package does not patch Drizzle. If Drizzle later generates the same objects itself, the SQL you already committed stays valid.
 
@@ -11,7 +11,7 @@ These are open Drizzle requests, and the v1.0.0-rc.5 notes don't add them. [PR #
 | Gap | Request |
 | --- | --- |
 | `CREATE FUNCTION` / `CREATE TRIGGER` | [drizzle-orm#843](https://github.com/drizzle-team/drizzle-orm/issues/843) |
-| `COMMENT ON` table and column | [drizzle-orm#886](https://github.com/drizzle-team/drizzle-orm/issues/886) |
+| `COMMENT ON` tables, columns, enums, views, routines, indexes, constraints, extensions | [drizzle-orm#886](https://github.com/drizzle-team/drizzle-orm/issues/886) |
 | `CREATE EXTENSION` | [drizzle-orm#2124](https://github.com/drizzle-team/drizzle-orm/issues/2124) |
 | Partitioned tables | [drizzle-orm#2854](https://github.com/drizzle-team/drizzle-orm/issues/2854) |
 
@@ -128,8 +128,8 @@ console.log(renderIdempotent(extras));
 | `pgTrigger(name, config)` | Bound to a Drizzle table or `{ name, schema }`. `columns` must be columns of that table. `when` can be SQL or `({ OLD, NEW }) => sql\`…\``. `OLD.email` renders as `OLD."email"`. |
 | `updatedAtTrigger(table, column)` | `BEFORE UPDATE` trigger. `column` must be `date`, `time`, or `timestamp`. Tables that share a database column name share one function, `set_<column>`. |
 | `pgExtension(name, { schema, version, cascade })` | `CREATE EXTENSION IF NOT EXISTS`, optionally `WITH SCHEMA` and `VERSION`. |
-| `withComment(target, text)` | Table, or a column builder such as `text("email")`. Returns the same object. Does not change Drizzle's SQL. |
-| `commentOn(tableOrColumn, text)` | Same `COMMENT ON` output, for a column that already belongs to a table. |
+| `withComment(target, text)` | Table, column builder, enum, finished view or materialized view, `pgFunction`, trigger, extension, or an index / `unique` / `check` / `primaryKey` / `foreignKey` builder. Returns the same object. Does not change Drizzle's SQL. |
+| `commentOn(target, text)` | Same `COMMENT ON` output for a table, column, enum, view, function, trigger, or extension you already hold. Indexes and constraints use `withComment` inside the table callback. |
 | `partitionedTable(table, { method, columns })` | Marks a drizzle-kit table as `RANGE`, `LIST`, or `HASH`. The migration converts the empty table. See [Partitioning](#partitioning). |
 | `pgPartition(name, { parent, ...bounds })` | `CREATE TABLE ... PARTITION OF`. Bounds are `from`/`to`, `in`, `modulus`/`remainder`, or `default: true`. |
 | `pgAttachPartition(table, { parent, ...bounds })` | `ALTER TABLE ... ATTACH PARTITION` for a table drizzle-kit already created. |
@@ -142,7 +142,38 @@ console.log(renderIdempotent(extras));
 
 A function's identity is `schema.name(arg types)`. Two overloads can coexist. A body, volatility, security, or `search_path` change is `CREATE OR REPLACE` (the oid stays, so triggers are left in place). A return type or argument type change is `DROP FUNCTION` plus create, and triggers that call that function are dropped and created around it. Postgres will not `CREATE OR REPLACE` a new return type.
 
-Comments that disappear become `COMMENT … IS NULL`. If the table or column also left the schema, the drop is omitted: the table migration drops the comment with the column. Removing a column that a trigger's `UPDATE OF` or `WHEN` still references takes two generates: change the trigger first, then drop the column. Postgres will not drop the column while the trigger depends on it.
+Comments that disappear become `COMMENT … IS NULL`. If the table, column, enum, view, index, or constraint also left the schema, the null comment is omitted: drizzle-kit's migration drops the comment with the object. The same omission applies when this package drops the function, trigger, or extension in the same file. Removing a column that a trigger's `UPDATE OF` or `WHEN` still references takes two generates: change the trigger first, then drop the column. Postgres will not drop the column while the trigger depends on it.
+
+```ts
+import { sql } from "drizzle-orm";
+import { check, index, pgEnum, pgTable, pgView, serial, text, unique } from "drizzle-orm/pg-core";
+import { pgFunction, withComment } from "drizzle-pg-extras";
+
+export const role = withComment(pgEnum("user_role", ["admin", "member"]), "Account role");
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  email: text("email").notNull(),
+  role: role("role").notNull(),
+}, (table) => [
+  withComment(index("users_email_idx").on(table.email), "Lookup by email"),
+  withComment(unique("users_email_key").on(table.email), "One email"),
+  withComment(check("users_email_check", sql`length(${table.email}) > 0`), "Email is not empty"),
+]);
+
+export const activeUsers = withComment(
+  pgView("active_users", { email: withComment(text("email"), "Visible email") }).as(sql`select email from users`),
+  "Users visible to the app",
+);
+
+export const setUpdatedAt = withComment(pgFunction("set_updated_at", {
+  returns: "trigger",
+  language: "plpgsql",
+  body: "BEGIN NEW.updated_at = now(); RETURN NEW; END;",
+}), "Sets updated_at");
+```
+
+`COMMENT ON` is idempotent. A removed comment is `COMMENT … IS NULL`. Run `drizzle-kit generate` before `drizzle-pg-extras generate` when the comment targets an enum, view, index, or constraint, so that object exists before the comment runs. A later `drizzle-kit generate` still reports no schema changes: the comment is not part of the kit snapshot.
 
 ## Partitioning
 
@@ -244,10 +275,14 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 ## What it does not do yet
 
 - Row level security policies. drizzle-kit already generates policies. The partition conversion copies policies that already exist on a parent; it does not author new ones.
-- Views and materialized views.
+- Creating views and materialized views. drizzle-kit does that. This package comments them.
 - Constraint triggers, deferrable triggers, and `REFERENCING` transition tables.
-- `OUT`, `INOUT`, and `VARIADIC` function arguments.
-- Enum, view, and function comments.
+- `OUT`, `INOUT`, and `VARIADIC` function arguments. Function comments use the `IN` argument types.
+- Comments on policies, sequences, rules, or individual enum labels.
+- Comments on a column-level `.unique()`, `.primaryKey()`, or `.references()`. Declare `unique()`, `primaryKey()`, or `foreignKey()` in the extra config and wrap that builder.
+- An index whose key is a SQL expression needs an explicit name before it can be commented. drizzle-kit requires that name too.
+- `updatedAtTrigger`'s generated function has no comment of its own. Comment the trigger, or declare the function with `pgFunction` and comment that.
+- Call `.as()` or `.existing()` before `withComment` on a view, and `.on()` before `withComment` on an index or unique constraint.
 - Pulling the live database back into the snapshot. The diff is against `_pg-extras.json`, not `pg_catalog`.
 - MySQL, SQLite, and SingleStore.
 - Creating the schema named in `WITH SCHEMA`. The schema has to exist (drizzle-kit can create it).
@@ -270,7 +305,7 @@ npm run typecheck
 npm run lint
 ```
 
-Unit tests cover SQL generation and the snapshot diff, including partition bounds. `POSTGRES_URL` points the integration tests at a real Postgres. One runs `drizzle-kit migrate`, checks that the trigger fires, and that the comments and extension exist. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. CI uses a Postgres 16 service container.
+Unit tests cover SQL generation and the snapshot diff, including comments and partition bounds. `POSTGRES_URL` points the integration tests at a real Postgres. One runs `drizzle-kit migrate`, checks that the trigger fires, and that comments on the table, column, enum, view, function, trigger, index, constraint, and extension exist. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. CI uses a Postgres 16 service container.
 
 ## License
 

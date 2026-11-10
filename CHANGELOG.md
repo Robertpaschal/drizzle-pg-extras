@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+Comments for the rest of the objects in [drizzle-orm#886](https://github.com/drizzle-team/drizzle-orm/issues/886).
+
+- `withComment` and `commentOn` now cover enums, views, materialized views, `pgFunction` functions, triggers, and extensions.
+- `withComment` on an index, unique index, `unique`, `check`, `primaryKey`, or `foreignKey` builder emits `COMMENT ON INDEX` or `COMMENT ON CONSTRAINT`. Put it inside the table extra-config callback.
+- Removing a comment emits `COMMENT … IS NULL`. If the object itself was dropped, that statement is omitted.
+- The statements are idempotent. A later `drizzle-kit generate` still reports no schema changes.
+- `_pg-extras.json` from 0.1.0 and 0.2.0 still loads.
+
 ## 0.2.0
 
 Declarative Postgres partitioning, for [drizzle-orm#2854](https://github.com/drizzle-team/drizzle-orm/issues/2854).

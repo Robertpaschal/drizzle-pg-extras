@@ -1,7 +1,7 @@
 {
   "name": "drizzle-pg-extras",
-  "version": "0.2.0",
-  "description": "Declare Postgres functions, triggers, comments, extensions, and partitioned tables next to a Drizzle schema and generate SQL migrations.",
+  "version": "0.3.0",
+  "description": "Declare Postgres functions, triggers, extensions, partitioned tables, and comments next to a Drizzle schema and generate SQL migrations.",
   "type": "module",
   "license": "MIT",
   "repository": {
