@@ -1,4 +1,4 @@
-import { Column, SQL, sql, getTableColumns, is, type Casing } from "drizzle-orm";
+import { Column, SQL, getTableColumns, is, type Casing } from "drizzle-orm";
 import { CasingCache, toCamelCase, toSnakeCase } from "drizzle-orm/casing";
 import {
   CheckBuilder,
@@ -26,6 +26,8 @@ import {
   assertColumnOfTable,
   extrasKind,
   readComment,
+  relationIdentity,
+  renderTriggerWhen,
   tableIdentity,
   type AnyPgEnum,
   type PgViewLike,
@@ -38,6 +40,7 @@ import {
   type PgPartition,
   type PgTrigger,
   type TriggerArg,
+  type TriggerInitially,
 } from "./defs.js";
 import { PgExtrasError } from "./errors.js";
 import { assertIdentifier, normalizeType, quoteIdent, quoteLiteral } from "./quote.js";
@@ -77,6 +80,14 @@ export type TriggerSnapshot = {
   functionName: string;
   functionArgsSql: string[];
   functionId: string | null;
+  constraint: boolean;
+  deferrable: boolean;
+  initially: TriggerInitially;
+  fromSchema: string | null;
+  fromTable: string | null;
+  oldTable: string | null;
+  newTable: string | null;
+  enabled: boolean;
 };
 
 export type ExtensionSnapshot = {
@@ -432,7 +443,7 @@ function snapshotTrigger(
   fnByObject: Map<PgFunction, FunctionSnapshot>,
   owned: FunctionSnapshot | null,
 ): TriggerSnapshot {
-  const identity = tableIdentity(trigger.table);
+  const identity = relationIdentity(trigger.table);
   const dbColumns = trigger.columns.map((column) => {
     if (typeof column === "string") return column;
     return nameOf(column);
@@ -461,7 +472,8 @@ function snapshotTrigger(
   }
   const name = trigger.name ?? `${identity.name}_set_${uniqueColumns[0] ?? nameOf(trigger.updatedAt!.column)}`;
   assertIdentifier("trigger", name);
-  const when = renderWhen(trigger, casing);
+  const when = renderTriggerWhen(trigger, casing);
+  const from = trigger.from ? tableIdentity(trigger.from) : null;
   return {
     id: JSON.stringify(["trigger", identity.schema, identity.name, name]),
     name,
@@ -476,43 +488,15 @@ function snapshotTrigger(
     functionName,
     functionArgsSql: trigger.args.map((arg) => renderTriggerArg(arg, casing, nameOf)),
     functionId,
+    constraint: trigger.constraint,
+    deferrable: trigger.deferrable,
+    initially: trigger.initially,
+    fromSchema: from?.schema ?? null,
+    fromTable: from?.name ?? null,
+    oldTable: trigger.oldTable,
+    newTable: trigger.newTable,
+    enabled: trigger.enabled,
   };
-}
-
-function renderWhen(trigger: PgTrigger, casing: Casing | undefined): string | null {
-  if (!trigger.when) return null;
-  let value: SQL | string;
-  if (typeof trigger.when === "function") {
-    if (!is(trigger.table, PgTable)) {
-      throw new PgExtrasError("WHEN callback needs a Drizzle table so NEW and OLD can be typed");
-    }
-    const refs = {
-      NEW: rowProxy(trigger.table, "NEW", casing),
-      OLD: rowProxy(trigger.table, "OLD", casing),
-    };
-    value = trigger.when(refs);
-  } else {
-    value = trigger.when;
-  }
-  const text = (typeof value === "string" ? value : renderSql(value, casing)).trim().replace(/;+\s*$/, "");
-  if (text.length === 0) return null;
-  if (text.includes(";")) {
-    throw new PgExtrasError(`trigger WHEN clause cannot contain ";"`);
-  }
-  return text;
-}
-
-function rowProxy(table: PgTable, alias: "NEW" | "OLD", casing: Casing | undefined): Record<string, SQL> {
-  const cache = new CasingCache(casing);
-  const refs: Record<string, SQL> = {};
-  for (const [key, column] of Object.entries(getTableColumns(table))) {
-    refs[key] = rawSql(`${alias}.${quoteIdent(cache.getColumnCasing(column))}`);
-  }
-  return refs;
-}
-
-function rawSql(text: string): SQL {
-  return sql.raw(text);
 }
 
 function renderTriggerArg(arg: TriggerArg, casing: Casing | undefined, nameOf: (column: AnyPgColumn) => string): string {
@@ -617,7 +601,77 @@ function fnShape(fn: FunctionSnapshot) {
 }
 
 export function sameTrigger(a: TriggerSnapshot, b: TriggerSnapshot): boolean {
-  return JSON.stringify({ ...a, id: undefined }) === JSON.stringify({ ...b, id: undefined });
+  return JSON.stringify(triggerShape(a, true)) === JSON.stringify(triggerShape(b, true));
+}
+
+/** Definition equality, ignoring the enabled flag. Enable and disable are `ALTER TABLE`. */
+export function sameTriggerShape(a: TriggerSnapshot, b: TriggerSnapshot): boolean {
+  return JSON.stringify(triggerShape(a, false)) === JSON.stringify(triggerShape(b, false));
+}
+
+function triggerShape(trigger: TriggerSnapshot, includeEnabled: boolean) {
+  return {
+    name: trigger.name,
+    schema: trigger.schema,
+    table: trigger.table,
+    timing: trigger.timing,
+    events: trigger.events,
+    forEach: trigger.forEach,
+    columns: trigger.columns,
+    when: trigger.when,
+    functionSchema: trigger.functionSchema,
+    functionName: trigger.functionName,
+    functionArgsSql: trigger.functionArgsSql,
+    functionId: trigger.functionId,
+    constraint: trigger.constraint,
+    deferrable: trigger.deferrable,
+    initially: trigger.initially,
+    fromSchema: trigger.fromSchema,
+    fromTable: trigger.fromTable,
+    oldTable: trigger.oldTable,
+    newTable: trigger.newTable,
+    enabled: includeEnabled ? trigger.enabled : true,
+  };
+}
+
+function normalizeTrigger(value: unknown): TriggerSnapshot {
+  if (!value || typeof value !== "object") throw new PgExtrasError("pg extras snapshot trigger is not an object");
+  const raw = value as Partial<TriggerSnapshot>;
+  if (typeof raw.name !== "string" || typeof raw.schema !== "string") {
+    throw new PgExtrasError("pg extras snapshot trigger is missing a name");
+  }
+  const timing = raw.timing === "before" || raw.timing === "after" || raw.timing === "instead of" ? raw.timing : "after";
+  const forEach = raw.forEach === "statement" ? "statement" : "row";
+  const initially = raw.initially === "deferred" ? "deferred" : "immediate";
+  const events = Array.isArray(raw.events) ? raw.events.filter((event): event is TriggerSnapshot["events"][number] =>
+    event === "insert" || event === "update" || event === "delete" || event === "truncate",
+  ) : [];
+  const table = typeof raw.table === "string" ? raw.table : "";
+  return {
+    id: typeof raw.id === "string" ? raw.id : JSON.stringify(["trigger", raw.schema, table, raw.name]),
+    name: raw.name,
+    schema: raw.schema,
+    table,
+    timing,
+    events,
+    forEach,
+    columns: Array.isArray(raw.columns) ? raw.columns.filter((column): column is string => typeof column === "string") : [],
+    when: typeof raw.when === "string" ? raw.when : null,
+    functionSchema: typeof raw.functionSchema === "string" ? raw.functionSchema : "public",
+    functionName: typeof raw.functionName === "string" ? raw.functionName : "",
+    functionArgsSql: Array.isArray(raw.functionArgsSql)
+      ? raw.functionArgsSql.filter((arg): arg is string => typeof arg === "string")
+      : [],
+    functionId: typeof raw.functionId === "string" ? raw.functionId : null,
+    constraint: raw.constraint === true,
+    deferrable: raw.deferrable === true,
+    initially,
+    fromSchema: typeof raw.fromSchema === "string" ? raw.fromSchema : null,
+    fromTable: typeof raw.fromTable === "string" ? raw.fromTable : null,
+    oldTable: typeof raw.oldTable === "string" ? raw.oldTable : null,
+    newTable: typeof raw.newTable === "string" ? raw.newTable : null,
+    enabled: raw.enabled === false ? false : true,
+  };
 }
 
 export function parseSnapshot(value: unknown): Snapshot {
@@ -628,7 +682,7 @@ export function parseSnapshot(value: unknown): Snapshot {
   return {
     version: 1,
     functions: record.functions ?? [],
-    triggers: record.triggers ?? [],
+    triggers: Array.isArray(record.triggers) ? record.triggers.map((trigger) => normalizeTrigger(trigger)) : [],
     extensions: record.extensions ?? [],
     comments,
     partitionedTables: record.partitionedTables ?? [],

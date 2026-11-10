@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+The rest of `CREATE TRIGGER`, for [drizzle-orm#843](https://github.com/drizzle-team/drizzle-orm/issues/843) and the deferrable trigger case in [drizzle-orm#1429](https://github.com/drizzle-team/drizzle-orm/issues/1429).
+
+- `constraint: true`, or `{ deferrable, initially, from }`, emits `CREATE CONSTRAINT TRIGGER`. `initially: "deferred"` requires `deferrable: true`. `from` is the referenced table. Postgres has no `OR REPLACE` for these, so a new or changed constraint trigger is `DROP TRIGGER IF EXISTS` plus create. Its comment is written again when the trigger is replaced.
+- `referencing: { oldTable, newTable }` emits `REFERENCING OLD TABLE AS ... NEW TABLE AS ...` on an `AFTER` trigger, for one event, at row or statement level.
+- `WHEN` and `UPDATE OF` were already emitted. They are now rejected at declaration when Postgres would reject them: `INSTEAD OF`, a statement `WHEN` that reads `OLD` or `NEW`, an `INSERT` `WHEN` that reads `OLD`, and a `DELETE` `WHEN` that reads `NEW`.
+- `INSTEAD OF` accepts a `pgView()`. `BEFORE` and `AFTER` on a view must be `forEach: "statement"`. Materialized views cannot have triggers.
+- `enabled: false` appends `ALTER TABLE ... DISABLE TRIGGER`. Turning it back on emits `ENABLE TRIGGER` without recreating the trigger. `CREATE OR REPLACE` enables a trigger, so a definition change that stays disabled emits `DISABLE` again.
+- `_pg-extras.json` from 0.3.0 still loads. A trigger comment stored there still clears with `COMMENT ON TRIGGER ... IS NULL`.
+
 ## 0.3.0
 
 Comments for the rest of the objects in [drizzle-orm#886](https://github.com/drizzle-team/drizzle-orm/issues/886).

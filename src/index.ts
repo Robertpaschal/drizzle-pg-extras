@@ -36,6 +36,10 @@ export {
   type TriggerEvent,
   type TriggerForEach,
   type TriggerArg,
+  type TriggerConstraint,
+  type TriggerReferencing,
+  type TriggerInitially,
+  type TriggerRelation,
   type RowRefs,
   type FunctionCall,
 } from "./defs.js";
@@ -69,6 +73,7 @@ export {
   dropFunctionSql,
   createTriggerSql,
   dropTriggerSql,
+  alterTriggerEnabledSql,
   createExtensionSql,
   dropExtensionSql,
   commentSql,

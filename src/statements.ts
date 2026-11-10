@@ -39,10 +39,24 @@ export function createTriggerSql(trigger: TriggerSnapshot): string {
     })
     .join(" OR ");
   const lines = [
-    `CREATE OR REPLACE TRIGGER ${quoteIdent(trigger.name)}`,
+    `${trigger.constraint ? "CREATE CONSTRAINT TRIGGER" : "CREATE OR REPLACE TRIGGER"} ${quoteIdent(trigger.name)}`,
     `${timing} ${events} ON ${qualify(trigger.schema, trigger.table)}`,
-    `FOR EACH ${trigger.forEach.toUpperCase()}`,
   ];
+  if (trigger.constraint && trigger.fromSchema && trigger.fromTable) {
+    lines.push(`FROM ${qualify(trigger.fromSchema, trigger.fromTable)}`);
+  }
+  if (trigger.constraint) {
+    lines.push(
+      trigger.deferrable
+        ? `DEFERRABLE INITIALLY ${trigger.initially === "deferred" ? "DEFERRED" : "IMMEDIATE"}`
+        : "NOT DEFERRABLE",
+    );
+  }
+  const referencing: string[] = [];
+  if (trigger.oldTable) referencing.push(`OLD TABLE AS ${quoteIdent(trigger.oldTable)}`);
+  if (trigger.newTable) referencing.push(`NEW TABLE AS ${quoteIdent(trigger.newTable)}`);
+  if (referencing.length > 0) lines.push(`REFERENCING ${referencing.join(" ")}`);
+  lines.push(`FOR EACH ${trigger.forEach.toUpperCase()}`);
   if (trigger.when) lines.push(`WHEN (${trigger.when})`);
   const args = trigger.functionArgsSql.join(", ");
   lines.push(`EXECUTE FUNCTION ${qualify(trigger.functionSchema, trigger.functionName)}(${args});`);
@@ -51,6 +65,11 @@ export function createTriggerSql(trigger: TriggerSnapshot): string {
 
 export function dropTriggerSql(trigger: TriggerSnapshot): string {
   return `DROP TRIGGER IF EXISTS ${quoteIdent(trigger.name)} ON ${qualify(trigger.schema, trigger.table)};`;
+}
+
+export function alterTriggerEnabledSql(trigger: TriggerSnapshot): string {
+  const action = trigger.enabled === false ? "DISABLE" : "ENABLE";
+  return `ALTER TABLE ${qualify(trigger.schema, trigger.table)} ${action} TRIGGER ${quoteIdent(trigger.name)};`;
 }
 
 export function createExtensionSql(ext: ExtensionSnapshot): string {

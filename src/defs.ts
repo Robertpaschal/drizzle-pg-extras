@@ -3,10 +3,13 @@ import {
   ColumnBuilder,
   getTableColumns,
   is,
+  sql,
   Table,
+  type Casing,
   type ColumnBuilderBase,
   type SQL,
 } from "drizzle-orm";
+import { CasingCache } from "drizzle-orm/casing";
 import {
   CheckBuilder,
   ForeignKeyBuilder,
@@ -20,7 +23,9 @@ import {
   UniqueConstraintBuilder,
   UniqueOnConstraintBuilder,
   ViewBuilder,
+  getMaterializedViewConfig,
   getTableConfig,
+  getViewConfig,
   isPgEnum,
   isPgMaterializedView,
   isPgView,
@@ -31,7 +36,8 @@ import {
   type PgView,
 } from "drizzle-orm/pg-core";
 import { PgExtrasError } from "./errors.js";
-import { assertIdentifier } from "./quote.js";
+import { assertIdentifier, quoteIdent } from "./quote.js";
+import { renderSql } from "./render-sql.js";
 
 const KIND = Symbol.for("drizzle-pg-extras.kind");
 const COMMENT = Symbol.for("drizzle-pg-extras.comment");
@@ -107,10 +113,30 @@ type UpdatedAtSource = {
   schema?: string;
 };
 
+export type TriggerInitially = "immediate" | "deferred";
+
+/** Options for `CREATE CONSTRAINT TRIGGER`. `true` means NOT DEFERRABLE. */
+export type TriggerConstraint = {
+  /** Default false: `NOT DEFERRABLE`. */
+  deferrable?: boolean;
+  /** Default `"immediate"`. `"deferred"` requires `deferrable: true`. */
+  initially?: TriggerInitially;
+  /** Referenced table in the `FROM` clause. */
+  from?: PgTable | { name: string; schema?: string };
+};
+
+/** Statement transition tables: `REFERENCING OLD TABLE AS ... NEW TABLE AS ...`. */
+export type TriggerReferencing = {
+  oldTable?: string;
+  newTable?: string;
+};
+
+export type TriggerRelation = PgTable | PgViewLike | { name: string; schema?: string };
+
 export type PgTrigger = {
   readonly [KIND]: "trigger";
   readonly name: string | null;
-  readonly table: PgTable | { name: string; schema?: string };
+  readonly table: TriggerRelation;
   readonly timing: TriggerTiming;
   readonly events: readonly TriggerEvent[];
   readonly forEach: TriggerForEach;
@@ -119,6 +145,14 @@ export type PgTrigger = {
   readonly function: FunctionCall | null;
   readonly args: readonly TriggerArg[];
   readonly updatedAt: UpdatedAtSource | null;
+  readonly constraint: boolean;
+  readonly deferrable: boolean;
+  readonly initially: TriggerInitially;
+  readonly from: PgTable | { name: string; schema?: string } | null;
+  readonly oldTable: string | null;
+  readonly newTable: string | null;
+  /** False emits `ALTER TABLE ... DISABLE TRIGGER` after the trigger exists. */
+  readonly enabled: boolean;
 };
 
 type WhenInput =
@@ -386,7 +420,14 @@ export function pgFunction(name: string, config: PgFunctionConfig): PgFunction {
   );
 }
 
-type TableTriggerConfig<TTable extends PgTable> = {
+type TriggerOptions = {
+  constraint?: boolean | TriggerConstraint;
+  referencing?: TriggerReferencing;
+  /** Default true. `false` emits `ALTER TABLE ... DISABLE TRIGGER`. Views cannot be disabled. */
+  enabled?: boolean;
+};
+
+type TableTriggerConfig<TTable extends PgTable> = TriggerOptions & {
   table: TTable;
   timing: "before" | "after";
   events: readonly TriggerEvent[];
@@ -397,7 +438,20 @@ type TableTriggerConfig<TTable extends PgTable> = {
   args?: readonly TriggerArg[];
 };
 
-type NameTriggerConfig = {
+type ViewColumn<TView> = Extract<TView[keyof TView], Column>;
+
+type ViewTriggerConfig<TView extends PgViewLike> = TriggerOptions & {
+  table: TView;
+  timing: TriggerTiming;
+  events: readonly TriggerEvent[];
+  forEach?: TriggerForEach;
+  columns?: readonly (ViewColumn<TView> | string)[];
+  when?: string | SQL;
+  function: FunctionCall;
+  args?: readonly TriggerArg[];
+};
+
+type NameTriggerConfig = TriggerOptions & {
   table: { name: string; schema?: string };
   timing: TriggerTiming;
   events: readonly TriggerEvent[];
@@ -409,8 +463,12 @@ type NameTriggerConfig = {
 };
 
 export function pgTrigger<TTable extends PgTable>(name: string, config: TableTriggerConfig<TTable>): PgTrigger;
+export function pgTrigger<TView extends PgViewLike>(name: string, config: ViewTriggerConfig<TView>): PgTrigger;
 export function pgTrigger(name: string, config: NameTriggerConfig): PgTrigger;
-export function pgTrigger(name: string, config: TableTriggerConfig<PgTable> | NameTriggerConfig): PgTrigger {
+export function pgTrigger(
+  name: string,
+  config: TableTriggerConfig<PgTable> | ViewTriggerConfig<PgViewLike> | NameTriggerConfig,
+): PgTrigger {
   assertIdentifier("trigger", name);
   return finishTrigger(name, config.table, {
     timing: config.timing,
@@ -420,6 +478,9 @@ export function pgTrigger(name: string, config: TableTriggerConfig<PgTable> | Na
     when: (config.when ?? null) as WhenInput | null,
     function: config.function,
     args: config.args,
+    constraint: config.constraint,
+    referencing: config.referencing,
+    enabled: config.enabled,
     updatedAt: null,
   });
 }
@@ -456,7 +517,7 @@ export function updatedAtTrigger<TTable extends PgTable>(
 
 function finishTrigger(
   name: string | null,
-  table: PgTable | { name: string; schema?: string },
+  table: TriggerRelation,
   config: {
     timing: TriggerTiming;
     events: readonly TriggerEvent[];
@@ -465,66 +526,110 @@ function finishTrigger(
     when: WhenInput | null;
     function: FunctionCall | null;
     args?: readonly TriggerArg[];
+    constraint?: boolean | TriggerConstraint;
+    referencing?: TriggerReferencing;
+    enabled?: boolean;
     updatedAt: UpdatedAtSource | null;
   },
 ): PgTrigger {
   const label = name ?? "updated-at trigger";
   if (!config.events || config.events.length === 0) {
-    throw new PgExtrasError(`pgTrigger("${label}"): events must include at least one event`);
+    triggerError(label, "events must include at least one event");
   }
   const events = EVENT_ORDER.filter((event) => config.events.includes(event));
   if (events.length !== new Set(config.events).size) {
-    throw new PgExtrasError(`pgTrigger("${label}"): unknown trigger event`);
+    triggerError(label, "unknown trigger event");
   }
   const forEach = config.forEach ?? "row";
   if (events.includes("truncate") && forEach === "row") {
-    throw new PgExtrasError(`pgTrigger("${label}"): truncate requires forEach: "statement"`);
+    triggerError(label, 'truncate requires forEach: "statement"');
   }
-  if (config.timing === "instead of") {
-    if (is(table, PgTable)) {
-      throw new PgExtrasError(
-        `pgTrigger("${label}"): INSTEAD OF is for views. Pass { name, schema } for a view, or use before/after on a table`,
-      );
-    }
-    if (forEach !== "row") {
-      throw new PgExtrasError(`pgTrigger("${label}"): INSTEAD OF requires forEach: "row"`);
-    }
-    if (events.includes("truncate")) {
-      throw new PgExtrasError(`pgTrigger("${label}"): INSTEAD OF cannot include truncate`);
-    }
+  const identity = relationIdentity(table);
+  if (identity.kind === "materializedView") {
+    triggerError(label, "materialized views cannot have triggers");
   }
   const columns = config.columns ?? [];
-  if (columns.length > 0 && !events.includes("update")) {
-    throw new PgExtrasError(`pgTrigger("${label}"): columns only apply to the update event`);
+  if (config.timing === "instead of") {
+    if (identity.kind === "table") {
+      triggerError(label, "INSTEAD OF triggers are only allowed on views. Pass a pgView() or { name, schema }");
+    }
+    if (forEach !== "row") {
+      triggerError(label, "INSTEAD OF triggers must be FOR EACH ROW");
+    }
+    if (events.includes("truncate")) {
+      triggerError(label, "INSTEAD OF triggers cannot include TRUNCATE");
+    }
+    if (columns.length > 0) {
+      triggerError(label, "INSTEAD OF triggers cannot have column lists");
+    }
+  } else if (identity.kind === "view") {
+    if (events.includes("truncate")) {
+      triggerError(label, "views cannot have TRUNCATE triggers");
+    }
+    if (forEach === "row") {
+      triggerError(
+        label,
+        'views cannot have row-level BEFORE or AFTER triggers. Use forEach: "statement", or INSTEAD OF FOR EACH ROW',
+      );
+    }
   }
-  if (is(table, PgTable)) {
+  if (columns.length > 0 && !events.includes("update")) {
+    triggerError(label, "columns only apply to the update event");
+  }
+  if (identity.kind === "table") {
     for (const column of columns) {
-      if (typeof column !== "string") assertColumnOfTable(table, column);
+      if (typeof column !== "string") assertColumnOfTable(table as PgTable, column);
+    }
+  } else if (identity.kind === "view") {
+    for (const column of columns) {
+      if (typeof column === "string") continue;
+      if (!viewOwnsColumn(table as PgViewLike, column, identity.name)) {
+        throw new PgExtrasError(`column "${column.name}" does not belong to view "${identity.name}"`);
+      }
     }
   } else {
     for (const column of columns) {
       if (typeof column !== "string") {
-        throw new PgExtrasError(`pgTrigger("${label}"): columns on a { name, schema } table must be database column name strings`);
+        triggerError(label, "columns on a { name, schema } table must be database column name strings");
       }
     }
-    assertIdentifier("table", table.name);
-    if (table.schema) assertIdentifier("table schema", table.schema);
+  }
+  const constraint = readConstraint(label, config.constraint, config.timing, forEach, identity.kind);
+  const referencing = readReferencing(label, config.referencing, {
+    timing: config.timing,
+    events,
+    columns: columns.length,
+    kind: identity.kind,
+    constraint: constraint !== null,
+  });
+  if (config.enabled !== undefined && typeof config.enabled !== "boolean") {
+    triggerError(label, "enabled must be a boolean");
+  }
+  const enabled = config.enabled ?? true;
+  if (!enabled && (identity.kind === "view" || config.timing === "instead of")) {
+    triggerError(label, "Postgres cannot DISABLE TRIGGER on a view");
+  }
+  const when = config.when;
+  const whenSql = renderWhenInput(label, table, when);
+  if (whenSql) {
+    assertWhenSql(label, whenSql, { timing: config.timing, events, forEach });
   }
   const fn = config.function;
   if (fn && extrasKind(fn) === "function") {
     const defined = fn as PgFunction;
     const returns = typeof defined.returns === "string" ? defined.returns.trim().toLowerCase() : defined.returns.getSQLType().toLowerCase();
     if (returns !== "trigger") {
-      throw new PgExtrasError(`pgTrigger("${label}"): function "${defined.name}" returns ${returns}, not trigger`);
+      triggerError(label, `function "${defined.name}" returns ${returns}, not trigger`);
     }
     const argCount = config.args?.length ?? 0;
     if (defined.args.length !== argCount) {
-      throw new PgExtrasError(
-        `pgTrigger("${label}"): function "${defined.name}" has ${defined.args.length} argument(s), but the trigger passes ${argCount}`,
+      triggerError(
+        label,
+        `function "${defined.name}" has ${defined.args.length} argument(s), but the trigger passes ${argCount}`,
       );
     }
   } else if (!fn && !config.updatedAt) {
-    throw new PgExtrasError(`pgTrigger("${label}"): function is required`);
+    triggerError(label, "function is required");
   }
   return brand(
     {
@@ -534,13 +639,277 @@ function finishTrigger(
       events,
       forEach,
       columns,
-      when: config.when,
+      when,
       function: fn,
       args: config.args ?? [],
       updatedAt: config.updatedAt,
+      constraint: constraint !== null,
+      deferrable: constraint?.deferrable ?? false,
+      initially: constraint?.initially ?? "immediate",
+      from: constraint?.from ?? null,
+      oldTable: referencing?.oldTable ?? null,
+      newTable: referencing?.newTable ?? null,
+      enabled,
     },
     "trigger",
   );
+}
+
+function triggerError(label: string, message: string): never {
+  throw new PgExtrasError(`pgTrigger("${label}"): ${message}`);
+}
+
+type RelationKind = "table" | "view" | "materializedView" | "name";
+
+export function relationIdentity(relation: TriggerRelation): { schema: string; name: string; kind: RelationKind } {
+  if (is(relation, PgTable)) {
+    const config = getTableConfig(relation);
+    return { schema: schemaName(config.schema), name: config.name, kind: "table" };
+  }
+  if (isPgView(relation) || isPgMaterializedView(relation)) {
+    const materialized = isPgMaterializedView(relation);
+    const config = materialized ? getMaterializedViewConfig(relation) : getViewConfig(relation);
+    return {
+      schema: schemaName(config.schema),
+      name: config.name,
+      kind: materialized ? "materializedView" : "view",
+    };
+  }
+  assertIdentifier("table", relation.name);
+  if (relation.schema) assertIdentifier("table schema", relation.schema);
+  return { schema: schemaName(relation.schema), name: relation.name, kind: "name" };
+}
+
+function viewOwnsColumn(view: PgViewLike, column: AnyPgColumn, viewName: string): boolean {
+  const entries = relationColumnEntries(view);
+  if (entries.some(([, owned]) => owned === column)) return true;
+  // pgView() column access returns a fresh alias of the view's column, not the selectedFields object.
+  const parent = column.table;
+  if (!is(parent, PgTable) || getTableConfig(parent).name !== viewName) return false;
+  return entries.some(([, owned]) => owned.name === column.name);
+}
+
+export function relationColumnEntries(relation: PgTable | PgViewLike): [string, AnyPgColumn][] {
+  if (is(relation, PgTable)) return Object.entries(getTableColumns(relation));
+  const config = isPgMaterializedView(relation) ? getMaterializedViewConfig(relation) : getViewConfig(relation);
+  const entries: [string, AnyPgColumn][] = [];
+  for (const [key, field] of Object.entries(config.selectedFields ?? {})) {
+    if (is(field, Column)) entries.push([key, field as AnyPgColumn]);
+  }
+  return entries;
+}
+
+function schemaName(schema: string | undefined): string {
+  return schema && schema.length > 0 ? schema : "public";
+}
+
+function readConstraint(
+  label: string,
+  constraint: boolean | TriggerConstraint | undefined,
+  timing: TriggerTiming,
+  forEach: TriggerForEach,
+  kind: RelationKind,
+): { deferrable: boolean; initially: TriggerInitially; from: PgTable | { name: string; schema?: string } | null } | null {
+  if (constraint === undefined || constraint === false) return null;
+  const value: TriggerConstraint = constraint === true ? {} : constraint;
+  if (typeof value !== "object" || value === null) {
+    triggerError(label, "constraint must be true or { deferrable, initially, from }");
+  }
+  const deferrable = value.deferrable ?? false;
+  const initially = value.initially ?? "immediate";
+  if (typeof deferrable !== "boolean") triggerError(label, "deferrable must be a boolean");
+  if (initially !== "immediate" && initially !== "deferred") {
+    triggerError(label, 'initially must be "immediate" or "deferred"');
+  }
+  if (initially === "deferred" && !deferrable) {
+    triggerError(label, "INITIALLY DEFERRED requires DEFERRABLE");
+  }
+  if (timing !== "after" || forEach !== "row" || (kind !== "table" && kind !== "name")) {
+    triggerError(label, "constraint triggers must be AFTER ... FOR EACH ROW on a table");
+  }
+  return { deferrable, initially, from: readReferencedTable(label, value.from) };
+}
+
+function readReferencedTable(
+  label: string,
+  from: TriggerConstraint["from"],
+): PgTable | { name: string; schema?: string } | null {
+  if (from === undefined) return null;
+  if (isPgView(from) || isPgMaterializedView(from)) {
+    triggerError(label, "FROM must reference a table");
+  }
+  if (is(from, PgTable)) return from;
+  if (typeof from === "object" && from !== null && "name" in from && typeof from.name === "string") {
+    assertIdentifier("referenced table", from.name);
+    if (from.schema !== undefined) {
+      if (typeof from.schema !== "string") triggerError(label, "FROM must reference a table");
+      assertIdentifier("referenced table schema", from.schema);
+    }
+    return { name: from.name, schema: from.schema };
+  }
+  triggerError(label, "FROM must reference a table");
+}
+
+function readReferencing(
+  label: string,
+  referencing: TriggerReferencing | undefined,
+  info: {
+    timing: TriggerTiming;
+    events: readonly TriggerEvent[];
+    columns: number;
+    kind: RelationKind;
+    constraint: boolean;
+  },
+): { oldTable: string | null; newTable: string | null } | null {
+  if (!referencing) return null;
+  const oldTable = referencing.oldTable || undefined;
+  const newTable = referencing.newTable || undefined;
+  if (!oldTable && !newTable) {
+    triggerError(label, "referencing needs oldTable or newTable");
+  }
+  if (oldTable) assertIdentifier("transition table", oldTable);
+  if (newTable) assertIdentifier("transition table", newTable);
+  if (oldTable && newTable && oldTable === newTable) {
+    triggerError(label, "OLD TABLE and NEW TABLE must have different names");
+  }
+  if (info.constraint) triggerError(label, "constraint triggers cannot use transition tables");
+  if (info.timing !== "after") triggerError(label, "transition tables are only allowed on AFTER triggers");
+  if (info.kind === "view" || info.kind === "materializedView") {
+    triggerError(label, "transition tables are only allowed on tables");
+  }
+  if (info.events.includes("truncate")) triggerError(label, "TRUNCATE triggers cannot use transition tables");
+  if (info.events.length !== 1) {
+    triggerError(label, "transition tables cannot be specified for triggers with more than one event");
+  }
+  if (info.columns > 0) triggerError(label, "transition tables cannot be combined with UPDATE OF");
+  const event = info.events[0];
+  if (oldTable && event !== "update" && event !== "delete") {
+    triggerError(label, "OLD TABLE is only allowed for UPDATE or DELETE");
+  }
+  if (newTable && event !== "update" && event !== "insert") {
+    triggerError(label, "NEW TABLE is only allowed for INSERT or UPDATE");
+  }
+  return { oldTable: oldTable ?? null, newTable: newTable ?? null };
+}
+
+/** Render a WHEN clause. Empty input becomes null. Throws when Postgres would reject the clause. */
+export function renderTriggerWhen(trigger: PgTrigger, casing?: Casing): string | null {
+  const label = trigger.name ?? "updated-at trigger";
+  const text = renderWhenInput(label, trigger.table, trigger.when, casing);
+  if (!text) return null;
+  assertWhenSql(label, text, { timing: trigger.timing, events: trigger.events, forEach: trigger.forEach });
+  return text;
+}
+
+function renderWhenInput(label: string, table: TriggerRelation, when: WhenInput | null, casing?: Casing): string | null {
+  if (!when) return null;
+  let value: SQL | string;
+  if (typeof when === "function") {
+    if (!is(table, PgTable) && !isPgView(table) && !isPgMaterializedView(table)) {
+      triggerError(label, "WHEN callback needs a Drizzle table or view so NEW and OLD can be typed");
+    }
+    const entries = relationColumnEntries(table);
+    value = when({
+      NEW: rowProxy(entries, "NEW", casing),
+      OLD: rowProxy(entries, "OLD", casing),
+    });
+  } else {
+    value = when;
+  }
+  const text = (typeof value === "string" ? value : renderSql(value, casing)).trim().replace(/;+\s*$/, "");
+  return text.length === 0 ? null : text;
+}
+
+function rowProxy(columns: readonly [string, AnyPgColumn][], alias: "NEW" | "OLD", casing: Casing | undefined): Record<string, SQL> {
+  const cache = new CasingCache(casing);
+  const refs: Record<string, SQL> = {};
+  for (const [key, column] of columns) {
+    refs[key] = sql.raw(`${alias}.${quoteIdent(cache.getColumnCasing(column))}`);
+  }
+  return refs;
+}
+
+function assertWhenSql(
+  label: string,
+  whenSql: string,
+  info: { timing: TriggerTiming; events: readonly TriggerEvent[]; forEach: TriggerForEach },
+): void {
+  if (whenSql.includes(";")) triggerError(label, 'WHEN clause cannot contain ";"');
+  if (info.timing === "instead of") triggerError(label, "INSTEAD OF triggers do not support WHEN");
+  const refs = whenReferences(whenSql);
+  if (refs.subquery) triggerError(label, "WHEN condition cannot contain a subquery");
+  if (info.forEach === "statement" && (refs.old || refs.new)) {
+    triggerError(label, "statement trigger WHEN cannot reference OLD or NEW");
+  }
+  if (info.events.includes("insert") && refs.old) triggerError(label, "INSERT trigger WHEN cannot reference OLD");
+  if (info.events.includes("delete") && refs.new) triggerError(label, "DELETE trigger WHEN cannot reference NEW");
+}
+
+function whenReferences(whenSql: string): { old: boolean; new: boolean; subquery: boolean } {
+  const stripped = stripSqlNoise(whenSql);
+  return {
+    old: /\bOLD\b/i.test(stripped),
+    new: /\bNEW\b/i.test(stripped),
+    subquery: /\b(?:SELECT|EXISTS)\b/i.test(stripped),
+  };
+}
+
+function stripSqlNoise(input: string): string {
+  let out = "";
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]!;
+    const next = input[i + 1];
+    if (ch === "-" && next === "-") {
+      out += " ";
+      i += 2;
+      while (i < input.length && input[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      out += " ";
+      const end = input.indexOf("*/", i + 2);
+      i = end === -1 ? input.length : end + 1;
+      continue;
+    }
+    if (ch === "'") {
+      out += " ";
+      i++;
+      while (i < input.length) {
+        if (input[i] === "'" && input[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (input[i] === "'") break;
+        i++;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      out += " ";
+      i++;
+      while (i < input.length) {
+        if (input[i] === '"' && input[i + 1] === '"') {
+          i += 2;
+          continue;
+        }
+        if (input[i] === '"') break;
+        i++;
+      }
+      continue;
+    }
+    if (ch === "$") {
+      const match = /^\$([A-Za-z0-9_]*)\$/.exec(input.slice(i));
+      if (match) {
+        const tag = match[0];
+        const end = input.indexOf(tag, i + tag.length);
+        out += " ";
+        i = end === -1 ? input.length : end + tag.length - 1;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
 }
 
 export function pgExtension(
