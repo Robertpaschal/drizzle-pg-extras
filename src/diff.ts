@@ -8,8 +8,9 @@ import {
 } from "./partition-sql.js";
 import { quoteIdent, quoteLiteral } from "./quote.js";
 import type { CommentSnapshot, InventoryView, PartitionedTableSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
-import { functionSignature, sameFunction, sameTrigger } from "./snapshot.js";
+import { functionSignature, sameFunction, sameTriggerShape } from "./snapshot.js";
 import {
+  alterTriggerEnabledSql,
   commentSql,
   createExtensionSql,
   createFunctionSql,
@@ -46,7 +47,7 @@ export function idempotentStatements(snapshot: Snapshot): string[] {
   for (const comment of snapshot.comments) {
     if (comment.kind !== "trigger") statements.push(commentSql(comment, comment.text));
   }
-  for (const trigger of snapshot.triggers) statements.push(createTriggerSql(trigger));
+  for (const trigger of snapshot.triggers) pushTriggerBody(statements, trigger, trigger.constraint === true);
   for (const comment of snapshot.comments) {
     if (comment.kind === "trigger") statements.push(commentSql(comment, comment.text));
   }
@@ -83,7 +84,9 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
   for (const trigger of from.triggers) {
     const next = toTriggers.get(trigger.id);
     const fnDropped = trigger.functionId !== null && dropFnIds.has(trigger.functionId);
-    if ((!next || fnDropped) && !(skipDroppedTables && tableGone(from, to, trigger.schema, trigger.table))) {
+    const constraintReplace = !!next && (trigger.constraint || next.constraint) && !sameTriggerShape(trigger, next);
+    const removed = !next;
+    if ((removed || fnDropped || constraintReplace) && !(skipDroppedTables && removed && tableGone(from, to, trigger.schema, trigger.table))) {
       triggersToDrop.push(trigger);
     }
   }
@@ -124,9 +127,13 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
 
   for (const trigger of to.triggers) {
     const prev = fromTriggers.get(trigger.id);
-    if (!prev || !sameTrigger(prev, trigger) || droppedTriggerIds.has(trigger.id)) {
-      statements.push(createTriggerSql(trigger));
+    const dropped = droppedTriggerIds.has(trigger.id);
+    const shapeChanged = !prev || !sameTriggerShape(prev, trigger);
+    if (shapeChanged || dropped) {
+      pushTriggerBody(statements, trigger, trigger.constraint === true && !dropped);
+      continue;
     }
+    if (prev.enabled !== trigger.enabled) statements.push(alterTriggerEnabledSql(trigger));
   }
 
   emitComments(statements, from, to, fromComments, toComments, dropFnIds, toFns, droppedTriggerIds, toTriggers, toExt, skipDroppedTables, "trigger");
@@ -136,6 +143,12 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
   }
 
   return statements;
+}
+
+function pushTriggerBody(statements: string[], trigger: TriggerSnapshot, dropFirst: boolean): void {
+  if (dropFirst) statements.push(dropTriggerSql(trigger));
+  statements.push(createTriggerSql(trigger));
+  if (trigger.enabled === false) statements.push(alterTriggerEnabledSql(trigger));
 }
 
 function emitComments(

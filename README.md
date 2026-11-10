@@ -57,6 +57,8 @@ export const touchUsers = pgTrigger("users_set_updated_at", {
 });
 ```
 
+`columns` is `UPDATE OF`. `when` is checked when the trigger is declared. Constraint triggers, transition tables, `INSTEAD OF` on a view, and `enabled: false` are in [Triggers](#triggers).
+
 The first `generate` writes a migration. The next one writes nothing until a definition changes. Only the difference is emitted, and the statements themselves are idempotent (`CREATE OR REPLACE`, `IF NOT EXISTS`, `DROP … IF EXISTS`).
 
 ## Install
@@ -125,7 +127,7 @@ console.log(renderIdempotent(extras));
 | Export | Role |
 | --- | --- |
 | `pgFunction(name, config)` | `plpgsql` or `sql`. Args are `IN` only. `returns` is a SQL type string or a Drizzle column (`users.id`). `searchPath: []` emits `SET search_path TO ''`. |
-| `pgTrigger(name, config)` | Bound to a Drizzle table or `{ name, schema }`. `columns` must be columns of that table. `when` can be SQL or `({ OLD, NEW }) => sql\`…\``. `OLD.email` renders as `OLD."email"`. |
+| `pgTrigger(name, config)` | Table, `pgView()`, or `{ name, schema }`. `columns` is `UPDATE OF`. `when` is SQL or `({ OLD, NEW }) => sql\`…\``. `constraint`, `referencing`, and `enabled: false` are in [Triggers](#triggers). |
 | `updatedAtTrigger(table, column)` | `BEFORE UPDATE` trigger. `column` must be `date`, `time`, or `timestamp`. Tables that share a database column name share one function, `set_<column>`. |
 | `pgExtension(name, { schema, version, cascade })` | `CREATE EXTENSION IF NOT EXISTS`, optionally `WITH SCHEMA` and `VERSION`. |
 | `withComment(target, text)` | Table, column builder, enum, finished view or materialized view, `pgFunction`, trigger, extension, or an index / `unique` / `check` / `primaryKey` / `foreignKey` builder. Returns the same object. Does not change Drizzle's SQL. |
@@ -174,6 +176,77 @@ export const setUpdatedAt = withComment(pgFunction("set_updated_at", {
 ```
 
 `COMMENT ON` is idempotent. A removed comment is `COMMENT … IS NULL`. Run `drizzle-kit generate` before `drizzle-pg-extras generate` when the comment targets an enum, view, index, or constraint, so that object exists before the comment runs. A later `drizzle-kit generate` still reports no schema changes: the comment is not part of the kit snapshot.
+
+## Triggers
+
+These sit next to the Drizzle tables they name. `profileEmails` is a `pgView`. The functions return `trigger`.
+
+```ts
+export const rejectNegative = pgFunction("reject_negative", {
+  returns: "trigger",
+  language: "plpgsql",
+  body: `BEGIN
+  IF NEW.amount < 0 THEN
+    RAISE EXCEPTION 'negative balance';
+  END IF;
+  RETURN NEW;
+END;`,
+});
+
+export const balancesAmount = pgTrigger("balances_amount", {
+  table: balances,
+  timing: "after",
+  events: ["insert", "update"],
+  columns: [balances.amount],
+  constraint: { deferrable: true, initially: "deferred", from: customers },
+  function: rejectNegative,
+});
+
+export const ledgerInserted = pgTrigger("ledger_inserted", {
+  table: ledger,
+  timing: "after",
+  events: ["insert"],
+  forEach: "statement",
+  referencing: { newTable: "inserted" },
+  function: countInserted,
+});
+
+export const profileEmailsInsert = pgTrigger("profile_emails_insert", {
+  table: profileEmails, // pgView(...)
+  timing: "instead of",
+  events: ["insert"],
+  function: insertProfile,
+});
+
+export const profilesGuard = pgTrigger("profiles_guard", {
+  table: profiles,
+  timing: "before",
+  events: ["delete"],
+  function: raiseAlways,
+  enabled: false, // ALTER TABLE ... DISABLE TRIGGER
+});
+```
+
+`constraint: true` is `CREATE CONSTRAINT TRIGGER ... NOT DEFERRABLE`. `deferrable: true` defaults to `INITIALLY IMMEDIATE`. `initially: "deferred"` requires `deferrable: true`. `from` is the referenced table in `FROM`. These are the deferrable trigger case from [drizzle-orm#1429](https://github.com/drizzle-team/drizzle-orm/issues/1429). `SET CONSTRAINTS` uses the trigger name. Postgres has no `CREATE OR REPLACE` for constraint triggers, so the first migration is `DROP TRIGGER IF EXISTS` plus `CREATE`, and a later change drops and creates again. A comment on that trigger is written again in the same migration.
+
+`referencing` is `REFERENCING OLD TABLE AS ... NEW TABLE AS ...`. The names are quoted identifiers. The trigger function reads them as tables (`SELECT count(*) FROM inserted`). `oldTable` is the before-image (`UPDATE` or `DELETE`). `newTable` is the after-image (`INSERT` or `UPDATE`). One event only. `FOR EACH ROW` and `FOR EACH STATEMENT` are both valid. The transition table is the whole statement either way.
+
+`enabled: false` appends `ALTER TABLE ... DISABLE TRIGGER`. `enabled: true` after that emits `ENABLE TRIGGER` and leaves the definition in place. `CREATE OR REPLACE` turns a trigger back on, so a body change that stays disabled emits `DISABLE` again.
+
+`withComment` on a trigger still emits `COMMENT ON TRIGGER ... ON table`. A normal `CREATE OR REPLACE` keeps that comment. A constraint trigger that is dropped and created gets the comment statement again.
+
+### Trigger limits
+
+- Constraint triggers are `AFTER` and `FOR EACH ROW` on a table. `WHEN` on one is evaluated when the row changes, including when the trigger itself is deferred.
+- `UNIQUE` and foreign keys are still drizzle-kit's. This package does not add `DEFERRABLE` to those table constraints. `from` does not create a foreign key.
+- Transition tables are `AFTER` triggers on tables, with one of `INSERT`, `UPDATE`, or `DELETE`. They cannot be combined with `UPDATE OF`, `TRUNCATE`, a constraint trigger, or a view.
+- `INSTEAD OF` is a view trigger, `FOR EACH ROW`, without `WHEN`, without `UPDATE OF`, and without `TRUNCATE`.
+- `BEFORE` and `AFTER` on a view are `forEach: "statement"`. Materialized views cannot have triggers.
+- `WHEN` cannot contain a subquery. An `INSERT` trigger cannot read `OLD`. A `DELETE` trigger cannot read `NEW`. A statement trigger cannot read `OLD` or `NEW`.
+- `ALTER TABLE ... DISABLE TRIGGER` does not work on a view, so `enabled: false` is rejected for views and for `INSTEAD OF`. `ENABLE REPLICA` and `ENABLE ALWAYS` are not emitted.
+- A `{ name, schema }` relation skips the checks that need a Drizzle table or view. Postgres still rejects a view trigger that was declared as a table.
+- Row-level transition triggers on a partition are rejected by Postgres when the migration runs. Foreign tables are not detected through `{ name, schema }`.
+- A view column is matched by view name and column name. Drizzle's view column alias does not carry the schema, so two views with the same name in different schemas are not told apart.
 
 ## Partitioning
 
@@ -275,8 +348,8 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 ## What it does not do yet
 
 - Row level security policies. drizzle-kit already generates policies. The partition conversion copies policies that already exist on a parent; it does not author new ones.
-- Creating views and materialized views. drizzle-kit does that. This package comments them.
-- Constraint triggers, deferrable triggers, and `REFERENCING` transition tables.
+- Creating views and materialized views. drizzle-kit does that. This package comments them and can put triggers on a view.
+- `DEFERRABLE` on `UNIQUE` and foreign keys. Deferrable constraint triggers are in [Triggers](#triggers).
 - `OUT`, `INOUT`, and `VARIADIC` function arguments. Function comments use the `IN` argument types.
 - Comments on policies, sequences, rules, or individual enum labels.
 - Comments on a column-level `.unique()`, `.primaryKey()`, or `.references()`. Declare `unique()`, `primaryKey()`, or `foreignKey()` in the extra config and wrap that builder.
@@ -305,7 +378,7 @@ npm run typecheck
 npm run lint
 ```
 
-Unit tests cover SQL generation and the snapshot diff, including comments and partition bounds. `POSTGRES_URL` points the integration tests at a real Postgres. One runs `drizzle-kit migrate`, checks that the trigger fires, and that comments on the table, column, enum, view, function, trigger, index, constraint, and extension exist. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. CI uses a Postgres 16 service container.
+Unit tests cover SQL generation and the snapshot diff, including comments, trigger rules, and partition bounds. `POSTGRES_URL` points the integration tests at a real Postgres. One runs `drizzle-kit migrate`, checks that the trigger fires, and that comments on the table, column, enum, view, function, trigger, index, constraint, and extension exist. Another checks a deferred constraint trigger, transition tables, `INSTEAD OF` on a view, `UPDATE OF` / `WHEN`, and `DISABLE TRIGGER`. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. CI uses a Postgres 16 service container.
 
 ## License
 
