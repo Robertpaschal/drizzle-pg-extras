@@ -49,7 +49,8 @@ export type ExtrasKind =
   | "comment"
   | "partitionedTable"
   | "partition"
-  | "detach";
+  | "detach"
+  | "hypertable";
 
 export type PgLanguage = "plpgsql" | "sql";
 export type PgVolatility = "volatile" | "stable" | "immutable";
@@ -232,6 +233,44 @@ export type PgDetach = {
   readonly parent: PartitionParent;
 };
 
+export type HypertableOrderSpec = {
+  column: AnyPgColumn | string;
+  direction: "asc" | "desc" | null;
+  nulls: "first" | "last" | null;
+};
+
+export type HypertableCompression = {
+  segmentBy: readonly (AnyPgColumn | string)[];
+  orderBy: readonly HypertableOrderSpec[];
+};
+
+export type HypertableRetention = {
+  dropAfter: string;
+  scheduleInterval: string | null;
+};
+
+export type HypertableCompressionPolicy = {
+  compressAfter: string;
+  scheduleInterval: string | null;
+};
+
+/**
+ * A drizzle-kit table that `generate` turns into a TimescaleDB hypertable.
+ * The table stays in the Drizzle schema. The migration calls `create_hypertable`.
+ */
+export type Hypertable = {
+  readonly [KIND]: "hypertable";
+  readonly table: PgTable | { name: string; schema?: string };
+  readonly timeColumn: AnyPgColumn | string;
+  readonly chunkTimeInterval: string | null;
+  readonly partitioningColumn: AnyPgColumn | string | null;
+  readonly numberPartitions: number | null;
+  readonly migrateData: boolean;
+  readonly compression: HypertableCompression | null;
+  readonly retention: HypertableRetention | null;
+  readonly compressionPolicy: HypertableCompressionPolicy | null;
+};
+
 export type PgExtras = {
   functions: PgFunction[];
   triggers: PgTrigger[];
@@ -243,6 +282,7 @@ export type PgExtras = {
   partitionedTables: PartitionedTable[];
   partitions: PgPartition[];
   detaches: PgDetach[];
+  hypertables: Hypertable[];
 };
 
 function brand<T extends object, K extends ExtrasKind>(value: T, kind: K): T & { readonly [KIND]: K } {
@@ -260,7 +300,8 @@ export function extrasKind(value: unknown): ExtrasKind | null {
     kind === "comment" ||
     kind === "partitionedTable" ||
     kind === "partition" ||
-    kind === "detach"
+    kind === "detach" ||
+    kind === "hypertable"
   ) {
     return kind;
   }
@@ -1239,8 +1280,20 @@ function readBound(label: string, config: PartitionInput): PartitionBoundSpec {
   return { kind: "default" };
 }
 
-function assertKeyCoveredByUniques(table: PgTable, keyColumns: readonly AnyPgColumn[]): void {
+function assertKeyCoveredByUniques(
+  table: PgTable,
+  keyColumns: readonly AnyPgColumn[],
+  options?: { where?: string; noun?: string; requirement?: string; expressionRequirement?: string },
+): void {
   const config = getTableConfig(table);
+  const where = options?.where ?? `partitionedTable(${config.name})`;
+  const noun = options?.noun ?? "partition key";
+  const requirement =
+    options?.requirement ??
+    "Postgres requires every primary key and unique constraint on a partitioned table to include the partition key.";
+  const expressionRequirement =
+    options?.expressionRequirement ??
+    "Postgres requires every unique index on a partitioned table to include the partition key.";
   const keyNames = keyColumns.map((column) => column.name);
   const groups: { label: string; names: string[] }[] = [];
   const singlePk = config.columns.filter((column) => column.primary).map((column) => column.name);
@@ -1266,9 +1319,7 @@ function assertKeyCoveredByUniques(table: PgTable, keyColumns: readonly AnyPgCol
     for (const column of index.config.columns) {
       if (!is(column, Column)) {
         const indexName = index.config.name ? ` "${index.config.name}"` : "";
-        throw new PgExtrasError(
-          `partitionedTable(${config.name}): unique index${indexName} includes an expression. Postgres requires every unique index on a partitioned table to include the partition key.`,
-        );
+        throw new PgExtrasError(`${where}: unique index${indexName} includes an expression. ${expressionRequirement}`);
       }
       names.push(column.name);
     }
@@ -1281,9 +1332,251 @@ function assertKeyCoveredByUniques(table: PgTable, keyColumns: readonly AnyPgCol
     const missing = keyNames.filter((key) => !group.names.includes(key));
     if (missing.length === 0) continue;
     throw new PgExtrasError(
-      `partitionedTable(${config.name}): ${group.label} (${group.names.join(", ")}) must include partition key ${missing.map((key) => `"${key}"`).join(", ")}. Postgres requires every primary key and unique constraint on a partitioned table to include the partition key.`,
+      `${where}: ${group.label} (${group.names.join(", ")}) must include ${noun} ${missing.map((key) => `"${key}"`).join(", ")}. ${requirement}`,
     );
   }
+}
+
+const INTERVAL_PART = String.raw`\d+(?:\.\d+)?\s+(?:microseconds?|milliseconds?|seconds?|minutes?|hours?|days?|weeks?|months?|years?)`;
+const INTERVAL_PATTERN = new RegExp(`^${INTERVAL_PART}(?:\\s+${INTERVAL_PART})*$`, "i");
+
+type HypertableOrderInput =
+  | AnyPgColumn
+  | string
+  | { column: AnyPgColumn | string; direction?: "asc" | "desc"; nulls?: "first" | "last" };
+
+type DrizzleHypertableConfig<TTable extends PgTable> = {
+  timeColumn: TTable["_"]["columns"][keyof TTable["_"]["columns"]];
+  chunkTimeInterval?: string;
+  partitioningColumn?: TTable["_"]["columns"][keyof TTable["_"]["columns"]];
+  numberPartitions?: number;
+  migrateData?: boolean;
+  compression?: {
+    segmentBy?: readonly TTable["_"]["columns"][keyof TTable["_"]["columns"]][];
+    orderBy?: readonly (
+      | TTable["_"]["columns"][keyof TTable["_"]["columns"]]
+      | {
+          column: TTable["_"]["columns"][keyof TTable["_"]["columns"]];
+          direction?: "asc" | "desc";
+          nulls?: "first" | "last";
+        }
+    )[];
+  };
+  retention?: { dropAfter: string; scheduleInterval?: string };
+  compressionPolicy?: { compressAfter: string; scheduleInterval?: string };
+};
+
+type NameHypertableConfig = {
+  timeColumn: string;
+  chunkTimeInterval?: string;
+  partitioningColumn?: string;
+  numberPartitions?: number;
+  migrateData?: boolean;
+  compression?: {
+    segmentBy?: readonly string[];
+    orderBy?: readonly (string | { column: string; direction?: "asc" | "desc"; nulls?: "first" | "last" })[];
+  };
+  retention?: { dropAfter: string; scheduleInterval?: string };
+  compressionPolicy?: { compressAfter: string; scheduleInterval?: string };
+};
+
+/**
+ * Turn the empty table drizzle-kit created into a TimescaleDB hypertable.
+ *
+ * There is no `ALTER TABLE` that does this, and this package does not rewrite the
+ * `CREATE TABLE` drizzle-kit already wrote. `generate` appends `create_hypertable`
+ * with `if_not_exists => TRUE`. Export `pgExtension("timescaledb")` from the schema too.
+ */
+export function hypertable<TTable extends PgTable>(table: TTable, config: DrizzleHypertableConfig<TTable>): Hypertable;
+export function hypertable(table: { name: string; schema?: string }, config: NameHypertableConfig): Hypertable;
+export function hypertable(
+  table: PgTable | { name: string; schema?: string },
+  config: DrizzleHypertableConfig<PgTable> | NameHypertableConfig,
+): Hypertable {
+  const identity = tableIdentity(table);
+  const where = `hypertable(${identity.schema}.${identity.name})`;
+  const drizzleTable = is(table, PgTable) ? table : null;
+  const timeColumn = resolveHypertableColumn(drizzleTable, config.timeColumn, `${where} timeColumn`);
+  if (drizzleTable && typeof timeColumn !== "string") {
+    if (!isHypertableTimeType(timeColumn.getSQLType())) {
+      throw new PgExtrasError(
+        `${where}: time column "${timeColumn.name}" is ${timeColumn.getSQLType()}. Use date, timestamp, or timestamptz. Integer time columns are not supported.`,
+      );
+    }
+    if (!columnIsNotNull(drizzleTable, timeColumn)) {
+      throw new PgExtrasError(
+        `${where}: time column "${timeColumn.name}" must be NOT NULL. Call .notNull(), or include it in the primary key.`,
+      );
+    }
+  }
+  const partitioningColumn =
+    config.partitioningColumn === undefined
+      ? null
+      : resolveHypertableColumn(drizzleTable, config.partitioningColumn, `${where} partitioningColumn`);
+  const hasCount = config.numberPartitions !== undefined;
+  if ((partitioningColumn === null) !== !hasCount) {
+    throw new PgExtrasError(`${where}: set partitioningColumn and numberPartitions together`);
+  }
+  const numberPartitions = hasCount ? requirePartitionCount(config.numberPartitions, where) : null;
+  if (partitioningColumn !== null && columnKey(timeColumn) === columnKey(partitioningColumn)) {
+    throw new PgExtrasError(`${where}: partitioningColumn must be a different column from timeColumn`);
+  }
+  if (config.migrateData !== undefined && typeof config.migrateData !== "boolean") {
+    throw new PgExtrasError(`${where}: migrateData must be a boolean`);
+  }
+  if (config.compressionPolicy && !config.compression) {
+    throw new PgExtrasError(`${where}: compressionPolicy requires compression. Pass compression: {} or set segmentBy and orderBy.`);
+  }
+  const keyColumns = [timeColumn, ...(partitioningColumn ? [partitioningColumn] : [])].filter(
+    (column): column is AnyPgColumn => typeof column !== "string",
+  );
+  if (drizzleTable && keyColumns.length > 0) {
+    assertKeyCoveredByUniques(drizzleTable, keyColumns, {
+      where,
+      noun: "hypertable key",
+      requirement:
+        "Timescale requires every primary key and unique index on a hypertable to include the time column and the space-partitioning column.",
+      expressionRequirement:
+        "Timescale requires every unique index on a hypertable to include the time column and the space-partitioning column.",
+    });
+  }
+  return brand(
+    {
+      table,
+      timeColumn,
+      chunkTimeInterval:
+        config.chunkTimeInterval === undefined ? null : normalizeInterval(config.chunkTimeInterval, `${where} chunkTimeInterval`),
+      partitioningColumn,
+      numberPartitions,
+      migrateData: config.migrateData ?? false,
+      compression: config.compression ? readCompression(drizzleTable, config.compression, where) : null,
+      retention: config.retention ? readRetention(config.retention, where) : null,
+      compressionPolicy: config.compressionPolicy ? readCompressionPolicy(config.compressionPolicy, where) : null,
+    },
+    "hypertable",
+  );
+}
+
+function readCompression(
+  table: PgTable | null,
+  compression: { segmentBy?: readonly (AnyPgColumn | string)[]; orderBy?: readonly HypertableOrderInput[] },
+  where: string,
+): HypertableCompression {
+  const segmentBy = (compression.segmentBy ?? []).map((column, index) =>
+    resolveHypertableColumn(table, column, `${where} compression.segmentBy[${index}]`),
+  );
+  const orderBy = (compression.orderBy ?? []).map((entry, index) => readOrder(table, entry, `${where} compression.orderBy[${index}]`));
+  assertDistinctColumns(segmentBy, `${where} compression.segmentBy`);
+  assertDistinctColumns(
+    orderBy.map((entry) => entry.column),
+    `${where} compression.orderBy`,
+  );
+  return { segmentBy, orderBy };
+}
+
+function readOrder(table: PgTable | null, entry: HypertableOrderInput, where: string): HypertableOrderSpec {
+  if (typeof entry === "string" || is(entry, Column)) {
+    return { column: resolveHypertableColumn(table, entry, where), direction: null, nulls: null };
+  }
+  if (!entry || typeof entry !== "object" || !("column" in entry)) {
+    throw new PgExtrasError(`${where} must be a column or { column, direction, nulls }`);
+  }
+  const direction = entry.direction ?? null;
+  const nulls = entry.nulls ?? null;
+  if (direction !== null && direction !== "asc" && direction !== "desc") {
+    throw new PgExtrasError(`${where}: direction must be "asc" or "desc"`);
+  }
+  if (nulls !== null && nulls !== "first" && nulls !== "last") {
+    throw new PgExtrasError(`${where}: nulls must be "first" or "last"`);
+  }
+  return { column: resolveHypertableColumn(table, entry.column, where), direction, nulls };
+}
+
+function readRetention(retention: { dropAfter: string; scheduleInterval?: string }, where: string): HypertableRetention {
+  if (retention.dropAfter === undefined) {
+    throw new PgExtrasError(`${where} retention requires dropAfter, such as "6 months"`);
+  }
+  return {
+    dropAfter: normalizeInterval(retention.dropAfter, `${where} retention.dropAfter`),
+    scheduleInterval:
+      retention.scheduleInterval === undefined ? null : normalizeInterval(retention.scheduleInterval, `${where} retention.scheduleInterval`),
+  };
+}
+
+function readCompressionPolicy(
+  policy: { compressAfter: string; scheduleInterval?: string },
+  where: string,
+): HypertableCompressionPolicy {
+  if (policy.compressAfter === undefined) {
+    throw new PgExtrasError(`${where} compressionPolicy requires compressAfter, such as "7 days"`);
+  }
+  return {
+    compressAfter: normalizeInterval(policy.compressAfter, `${where} compressionPolicy.compressAfter`),
+    scheduleInterval:
+      policy.scheduleInterval === undefined
+        ? null
+        : normalizeInterval(policy.scheduleInterval, `${where} compressionPolicy.scheduleInterval`),
+  };
+}
+
+function resolveHypertableColumn(table: PgTable | null, column: AnyPgColumn | string, where: string): AnyPgColumn | string {
+  if (table) {
+    if (typeof column === "string") {
+      throw new PgExtrasError(`${where}: pass a column from the Drizzle table, not a name string`);
+    }
+    assertColumnOfTable(table, column);
+    return column;
+  }
+  if (typeof column !== "string") {
+    throw new PgExtrasError(`${where}: pass a database column name string`);
+  }
+  assertIdentifier("column", column);
+  return column;
+}
+
+function columnKey(column: AnyPgColumn | string): string {
+  return typeof column === "string" ? column : column.name;
+}
+
+function assertDistinctColumns(columns: readonly (AnyPgColumn | string)[], where: string): void {
+  const seen = new Set<string>();
+  for (const column of columns) {
+    const key = columnKey(column);
+    if (seen.has(key)) throw new PgExtrasError(`${where}: duplicate column "${key}"`);
+    seen.add(key);
+  }
+}
+
+function columnIsNotNull(table: PgTable, column: AnyPgColumn): boolean {
+  if (column.notNull || column.primary) return true;
+  return getTableConfig(table).primaryKeys.some((constraint) => constraint.columns.includes(column));
+}
+
+function isHypertableTimeType(sqlType: string): boolean {
+  const type = sqlType.trim().toLowerCase();
+  return type === "date" || type.startsWith("timestamp");
+}
+
+function requirePartitionCount(value: number | undefined, where: string): number {
+  if (!Number.isInteger(value) || value! < 1) {
+    throw new PgExtrasError(`${where}: numberPartitions must be an integer >= 1`);
+  }
+  return value!;
+}
+
+function normalizeInterval(value: string, where: string): string {
+  if (typeof value !== "string") {
+    throw new PgExtrasError(`${where} must be an interval such as "1 day" or "7 days"`);
+  }
+  const normalized = value.trim().replace(/\s+/g, " ").toLowerCase();
+  if (!INTERVAL_PATTERN.test(normalized)) {
+    throw new PgExtrasError(`${where} must be an interval such as "1 day" or "7 days", with no SQL punctuation`);
+  }
+  for (const part of normalized.match(new RegExp(INTERVAL_PART, "gi")) ?? []) {
+    const quantity = Number(part.split(/\s+/)[0]);
+    if (!(quantity > 0)) throw new PgExtrasError(`${where} must be greater than 0`);
+  }
+  return normalized;
 }
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {

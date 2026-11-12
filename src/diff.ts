@@ -7,7 +7,21 @@ import {
   dropPartitionSql,
 } from "./partition-sql.js";
 import { quoteIdent, quoteLiteral } from "./quote.js";
-import type { CommentSnapshot, InventoryView, PartitionedTableSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
+import type { CommentSnapshot, HypertableSnapshot, InventoryView, PartitionedTableSnapshot, Snapshot, TriggerSnapshot } from "./snapshot.js";
+import {
+  addCompressionPolicySql,
+  addHypertableDimensionSql,
+  addRetentionPolicySql,
+  createHypertableStatements,
+  disableHypertableCompressionSql,
+  enableHypertableCompressionSql,
+  leaveChunkIntervalSql,
+  leaveHypertableDimensionSql,
+  leaveHypertableSql,
+  removeCompressionPolicySql,
+  removeRetentionPolicySql,
+  setChunkTimeIntervalSql,
+} from "./timescale-sql.js";
 import { functionSignature, sameFunction, sameTriggerShape } from "./snapshot.js";
 import {
   alterTriggerEnabledSql,
@@ -44,6 +58,7 @@ export function idempotentStatements(snapshot: Snapshot): string[] {
   for (const fn of snapshot.functions) statements.push(createFunctionSql(fn));
   if (sqlFunctions) statements.push("SET check_function_bodies = on");
   statements.push(...partitionStatements(snapshot));
+  for (const hypertable of snapshot.hypertables) statements.push(...createHypertableStatements(hypertable));
   for (const comment of snapshot.comments) {
     if (comment.kind !== "trigger") statements.push(commentSql(comment, comment.text));
   }
@@ -114,6 +129,8 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
     }
   }
 
+  statements.push(...hypertableChanges(from, to, skipDroppedTables));
+
   const fnsToWrite = to.functions.filter((fn) => {
     const prev = fromFns.get(fn.id);
     return !prev || !sameFunction(prev, fn);
@@ -139,7 +156,12 @@ function statementsBetween(from: Snapshot, to: Snapshot, skipDroppedTables: bool
   emitComments(statements, from, to, fromComments, toComments, dropFnIds, toFns, droppedTriggerIds, toTriggers, toExt, skipDroppedTables, "trigger");
 
   for (const ext of [...from.extensions].sort((a, b) => a.id.localeCompare(b.id))) {
-    if (!toExt.has(ext.id)) statements.push(dropExtensionSql(ext));
+    if (!toExt.has(ext.id)) {
+      // Down SQL for a new hypertable leaves the table as a hypertable, so dropping
+      // timescaledb in that same file would fail. A forward drop still emits DROP EXTENSION.
+      if (ext.name === "timescaledb" && !skipDroppedTables && from.hypertables.length > 0) continue;
+      statements.push(dropExtensionSql(ext));
+    }
   }
 
   return statements;
@@ -212,6 +234,91 @@ function skipCommentNull(
   if (comment.kind === "trigger") return !toTriggers.has(comment.id);
   if (comment.kind === "extension") return !toExt.has(comment.name);
   return skipDroppedTables && targetGone(from, to, comment);
+}
+
+function hypertableChanges(from: Snapshot, to: Snapshot, forward: boolean): string[] {
+  const statements: string[] = [];
+  const fromTables = new Map(from.hypertables.map((item) => [item.id, item]));
+  const toTables = new Map(to.hypertables.map((item) => [item.id, item]));
+
+  for (const prev of from.hypertables) {
+    if (toTables.has(prev.id)) continue;
+    if (forward && tableGone(from, to, prev.schema, prev.name)) continue;
+    if (forward) {
+      throw new PgExtrasError(
+        `hypertable ${prev.schema}.${prev.name} was removed from the schema. This package will not convert a hypertable back into a regular table. Keep hypertable(), or remove the Drizzle table in the same change so drizzle-kit drops it.`,
+      );
+    }
+    statements.push(...undoHypertable(prev));
+  }
+
+  for (const next of to.hypertables) {
+    const prev = fromTables.get(next.id);
+    if (!prev) {
+      statements.push(...createHypertableStatements(next));
+      continue;
+    }
+    statements.push(...alterHypertable(prev, next, forward));
+  }
+  return statements;
+}
+
+function undoHypertable(ht: HypertableSnapshot): string[] {
+  const statements: string[] = [];
+  if (ht.compressionPolicy) statements.push(removeCompressionPolicySql(ht));
+  if (ht.retention) statements.push(removeRetentionPolicySql(ht));
+  if (ht.compression) statements.push(disableHypertableCompressionSql(ht));
+  statements.push(leaveHypertableSql(ht));
+  return statements;
+}
+
+function alterHypertable(prev: HypertableSnapshot, next: HypertableSnapshot, forward: boolean): string[] {
+  if (prev.timeColumn !== next.timeColumn) {
+    throw new PgExtrasError(
+      `hypertable ${next.schema}.${next.name} time column changed from "${prev.timeColumn}" to "${next.timeColumn}". The time column cannot be changed in place.`,
+    );
+  }
+  const statements: string[] = [];
+  if (prev.partitioningColumn !== next.partitioningColumn || prev.numberPartitions !== next.numberPartitions) {
+    if (prev.partitioningColumn === null && next.partitioningColumn !== null) {
+      statements.push(addHypertableDimensionSql(next));
+    } else if (!forward && next.partitioningColumn === null) {
+      statements.push(leaveHypertableDimensionSql(prev));
+    } else {
+      throw new PgExtrasError(
+        `hypertable ${next.schema}.${next.name} space partition changed from ${describeSpace(prev)} to ${describeSpace(next)}. create_hypertable does not alter an existing hash dimension. Keep partitioningColumn and numberPartitions.`,
+      );
+    }
+  }
+  if (prev.chunkTimeInterval !== next.chunkTimeInterval) {
+    if (next.chunkTimeInterval === null) {
+      if (forward) {
+        throw new PgExtrasError(
+          `hypertable ${next.schema}.${next.name}: clearing chunkTimeInterval is not supported. Set a new interval instead of removing it.`,
+        );
+      }
+      statements.push(leaveChunkIntervalSql(prev));
+    } else {
+      statements.push(setChunkTimeIntervalSql(next));
+    }
+  }
+  const compressionChanged = JSON.stringify(prev.compression) !== JSON.stringify(next.compression);
+  const compressionPolicyChanged = JSON.stringify(prev.compressionPolicy) !== JSON.stringify(next.compressionPolicy);
+  const retentionChanged = JSON.stringify(prev.retention) !== JSON.stringify(next.retention);
+  if (compressionPolicyChanged && prev.compressionPolicy) statements.push(removeCompressionPolicySql(prev));
+  if (compressionChanged) {
+    if (next.compression) statements.push(enableHypertableCompressionSql(next, next.compression, prev.compression));
+    else statements.push(disableHypertableCompressionSql(next));
+  }
+  if (compressionPolicyChanged && next.compressionPolicy) statements.push(addCompressionPolicySql(next));
+  if (retentionChanged && prev.retention) statements.push(removeRetentionPolicySql(prev));
+  if (retentionChanged && next.retention) statements.push(addRetentionPolicySql(next));
+  return statements;
+}
+
+function describeSpace(ht: HypertableSnapshot): string {
+  if (!ht.partitioningColumn) return "none";
+  return `${ht.partitioningColumn} (${ht.numberPartitions})`;
 }
 
 function partitionChanges(from: Snapshot, to: Snapshot, skipDroppedTables: boolean): string[] {

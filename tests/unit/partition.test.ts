@@ -154,6 +154,7 @@ describe("partition sql", () => {
       inventory: { scanned: true, tables: [] },
     });
     expect(parsed.partitionedTables).toEqual([]);
+    expect(parsed.hypertables).toEqual([]);
     expect(diffSnapshots(parsed, parsed).up).toEqual([]);
   });
 
