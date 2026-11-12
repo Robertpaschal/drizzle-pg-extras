@@ -12,6 +12,7 @@ export {
   pgPartition,
   pgAttachPartition,
   pgDetachPartition,
+  hypertable,
   type PgFunction,
   type PgFunctionArg,
   type PgFunctionConfig,
@@ -25,6 +26,11 @@ export {
   type PartitionedTable,
   type PgPartition,
   type PgDetach,
+  type Hypertable,
+  type HypertableOrderSpec,
+  type HypertableCompression,
+  type HypertableRetention,
+  type HypertableCompressionPolicy,
   type PartitionMethod,
   type PartitionBound,
   type PartitionBoundSpec,
@@ -56,6 +62,11 @@ export {
   type PartitionedTableSnapshot,
   type PartitionSnapshot,
   type DetachSnapshot,
+  type HypertableSnapshot,
+  type HypertableCompressionSnapshot,
+  type HypertableRetentionSnapshot,
+  type HypertableCompressionPolicySnapshot,
+  type HypertableOrderSnapshot,
 } from "./snapshot.js";
 export { diffSnapshots, idempotentStatements, type SqlDiff } from "./diff.js";
 export {
@@ -85,3 +96,18 @@ export {
   detachPartitionSql,
   dropPartitionSql,
 } from "./partition-sql.js";
+export {
+  createHypertableSql,
+  createHypertableStatements,
+  setChunkTimeIntervalSql,
+  addHypertableDimensionSql,
+  enableHypertableCompressionSql,
+  disableHypertableCompressionSql,
+  addRetentionPolicySql,
+  removeRetentionPolicySql,
+  addCompressionPolicySql,
+  removeCompressionPolicySql,
+  leaveHypertableSql,
+  leaveHypertableDimensionSql,
+  leaveChunkIntervalSql,
+} from "./timescale-sql.js";

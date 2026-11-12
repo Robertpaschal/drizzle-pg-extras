@@ -4,6 +4,7 @@ import {
   extrasKind,
   isPlainRecord,
   type AnyPgEnum,
+  type Hypertable,
   type PartitionedTable,
   type PgComment,
   type PgDetach,
@@ -27,6 +28,7 @@ export function collectExtras(modules: Record<string, unknown> | readonly Record
     partitionedTables: [],
     partitions: [],
     detaches: [],
+    hypertables: [],
   };
   const seen = new Set<unknown>();
   const list = Array.isArray(modules) ? modules : [modules];
@@ -51,6 +53,7 @@ export function defineExtras(input: {
   partitionedTables?: readonly PartitionedTable[];
   partitions?: readonly PgPartition[];
   detaches?: readonly PgDetach[];
+  hypertables?: readonly Hypertable[];
 }): PgExtras {
   return collectExtras({
     functions: input.functions ?? [],
@@ -63,6 +66,7 @@ export function defineExtras(input: {
     partitionedTables: input.partitionedTables ?? [],
     partitions: input.partitions ?? [],
     detaches: input.detaches ?? [],
+    hypertables: input.hypertables ?? [],
   });
 }
 
@@ -105,6 +109,12 @@ function walk(value: unknown, extras: PgExtras, seen: Set<unknown>): void {
   }
   if (kind === "detach") {
     extras.detaches.push(value as PgDetach);
+    return;
+  }
+  if (kind === "hypertable") {
+    const hypertable = value as Hypertable;
+    extras.hypertables.push(hypertable);
+    if (is(hypertable.table, PgTable)) walk(hypertable.table, extras, seen);
     return;
   }
   if (isPgView(value) || isPgMaterializedView(value)) {

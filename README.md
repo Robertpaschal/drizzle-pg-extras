@@ -1,6 +1,6 @@
 # drizzle-pg-extras
 
-Declare the Postgres objects Drizzle still can't model — functions, triggers, comments, extensions, and partitioned tables — in TypeScript next to your Drizzle tables, and turn them into ordinary SQL migration files.
+Declare the Postgres objects Drizzle still can't model — functions, triggers, comments, extensions, partitioned tables, and TimescaleDB hypertables — in TypeScript next to your Drizzle tables, and turn them into ordinary SQL migration files.
 
 `drizzle-kit migrate` applies those files. This package does not patch Drizzle. If Drizzle later generates the same objects itself, the SQL you already committed stays valid.
 
@@ -14,8 +14,9 @@ These are open Drizzle requests, and the v1.0.0-rc.5 notes don't add them. [PR #
 | `COMMENT ON` tables, columns, enums, views, routines, indexes, constraints, extensions | [drizzle-orm#886](https://github.com/drizzle-team/drizzle-orm/issues/886) |
 | `CREATE EXTENSION` | [drizzle-orm#2124](https://github.com/drizzle-team/drizzle-orm/issues/2124) |
 | Partitioned tables | [drizzle-orm#2854](https://github.com/drizzle-team/drizzle-orm/issues/2854) |
+| TimescaleDB hypertables | [drizzle-orm#2962](https://github.com/drizzle-team/drizzle-orm/issues/2962) |
 
-Smaller packages already cover one of those pieces each: [`drizzle-triggers`](https://github.com/RagedPanda/drizzle-triggers), [`@onozaty/drizzle-db-comments-generator`](https://github.com/onozaty/drizzle-db-comments-generator), and [`drizzle-partition`](https://github.com/Rezarys/drizzle-partition). This package is the Postgres slice people keep asking to put in one schema: functions, triggers, comments, extensions, and partitions. `drizzle-partition` rewrites the `CREATE TABLE` drizzle-kit already wrote. This package leaves that file alone and appends a migration. See [Partitioning](#partitioning).
+Smaller packages already cover one of those pieces each: [`drizzle-triggers`](https://github.com/RagedPanda/drizzle-triggers), [`@onozaty/drizzle-db-comments-generator`](https://github.com/onozaty/drizzle-db-comments-generator), and [`drizzle-partition`](https://github.com/Rezarys/drizzle-partition). This package is the Postgres slice people keep asking to put in one schema: functions, triggers, comments, extensions, partitions, and TimescaleDB hypertables. `drizzle-partition` rewrites the `CREATE TABLE` drizzle-kit already wrote. This package leaves that file alone and appends a migration. See [Partitioning](#partitioning) and [TimescaleDB](#timescaledb).
 
 ## Example
 
@@ -136,6 +137,7 @@ console.log(renderIdempotent(extras));
 | `pgPartition(name, { parent, ...bounds })` | `CREATE TABLE ... PARTITION OF`. Bounds are `from`/`to`, `in`, `modulus`/`remainder`, or `default: true`. |
 | `pgAttachPartition(table, { parent, ...bounds })` | `ALTER TABLE ... ATTACH PARTITION` for a table drizzle-kit already created. |
 | `pgDetachPartition(table, { parent })` | `ALTER TABLE ... DETACH PARTITION`. The table is kept. |
+| `hypertable(table, config)` | `create_hypertable` with `if_not_exists`, plus optional compression, a retention policy, and a compression policy. Requires `pgExtension("timescaledb")`. See [TimescaleDB](#timescaledb). |
 | `defineExtras` / `collectExtras` | Bundle objects, or scan a module's exports (the CLI does the scan). |
 | `generate` / `diffSnapshots` / `snapshotExtras` | Diff against the stored snapshot and write files. |
 | `renderIdempotent` | Create-or-replace script for everything currently declared. No drops. |
@@ -327,11 +329,72 @@ The conversion copies columns, defaults, identity, indexes, checks, and column c
 - A later drizzle-kit migration that drops and recreates the parent (some column type changes) drops the partitions with it. The extras snapshot already says the table is partitioned, so this package will not emit the conversion again. Repair that kit migration by hand.
 - Down SQL drops created partitions when they are empty, detaches attached tables, and converts the parent back when it is empty. It raises when a created partition still has rows. `drizzle-kit migrate` does not run the down file.
 
+## TimescaleDB
+
+This is a community package. It is not an official Timescale or Tiger Data tool, and it is not part of Drizzle. Nobody at Timescale reviewed this SQL. It generates the calls people asked for on [drizzle-orm#2962](https://github.com/drizzle-team/drizzle-orm/issues/2962): turn a normal table into a hypertable, then optionally compress it and add retention and compression policies.
+
+The table stays in the Drizzle schema, so drizzle-kit still owns columns, indexes, and keys. `generate` appends `SELECT create_hypertable(..., if_not_exists => TRUE)`. That is the same shape as the custom migration in the issue thread. Timescale's newer `CREATE TABLE ... WITH (tsdb.hypertable)` has to be on the `CREATE TABLE` itself, and this package does not rewrite the file drizzle-kit already wrote.
+
+`pgExtension("timescaledb")` has to be exported from the schema. `generate` throws if it is missing, and it writes `CREATE EXTENSION` before `create_hypertable` when both are new. A hypertable does not need the extension before the table: drizzle-kit creates an ordinary table, then this migration converts it. Run `drizzle-kit generate`, then `drizzle-pg-extras generate`, then `drizzle-kit migrate`, and load data after that.
+
+```ts
+import { integer, pgTable, text, timestamp, primaryKey } from "drizzle-orm/pg-core";
+import { hypertable, pgExtension } from "drizzle-pg-extras";
+
+export const timescale = pgExtension("timescaledb");
+
+export const metrics = pgTable("metrics", {
+  time: timestamp("time", { withTimezone: true }).notNull(),
+  deviceId: text("device_id").notNull(),
+  value: integer("value").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.time, t.deviceId] }),
+]);
+
+export const metricsHypertable = hypertable(metrics, {
+  timeColumn: metrics.time,
+  chunkTimeInterval: "1 day", // omitted: Timescale's default is 7 days
+  partitioningColumn: metrics.deviceId, // hash dimension; requires numberPartitions
+  numberPartitions: 4,
+  migrateData: false, // true makes create_hypertable copy rows that are already in the table
+  compression: {
+    segmentBy: [metrics.deviceId],
+    orderBy: [{ column: metrics.time, direction: "desc", nulls: "last" }],
+  },
+  retention: { dropAfter: "6 months", scheduleInterval: "1 day" },
+  compressionPolicy: { compressAfter: "7 days" },
+});
+```
+
+`chunkTimeInterval`, `dropAfter`, `compressAfter`, and `scheduleInterval` are interval strings such as `"7 days"` or `"1 day 12 hours"`. They are quoted into `INTERVAL '...'`. `compression: {}` enables compression with Timescale's defaults. A compression policy requires `compression`, because Timescale rejects the policy until compression is on.
+
+Every primary key and unique index on a Drizzle table has to include the time column and the space column, when you set one. Timescale requires that, and `hypertable()` rejects the table when one does not. The time column has to be `NOT NULL` and a `date`, `timestamp`, or `timestamptz`. A `{ name, schema }` table with string column names skips those checks.
+
+The statements are idempotent. `create_hypertable`, `add_retention_policy`, and `add_compression_policy` all pass `if_not_exists => TRUE`, and the compression `ALTER TABLE` can run again. Running the migration twice is a no-op when the hypertable, settings, and policies are already in place. `if_not_exists` does not change an existing policy's interval, so a later edit removes the policy and adds it again. A later `chunkTimeInterval` emits `set_chunk_time_interval`. Adding `partitioningColumn` after the hypertable exists emits `add_dimension`. `migrateData` is read only when the hypertable is first created; changing it later does not write a migration.
+
+A later `drizzle-kit generate` still diffs your tables and reports no schema changes. `_pg-extras.json` from 0.4.0 still loads. Hypertable keys are added the next time a migration is written.
+
+### Timescale limits
+
+- Continuous aggregates are out of scope. They are materialized views with `timescaledb.continuous`, and `drizzle-kit generate` rewrites views, which drops those options. Owning the `SELECT` would also make this package responsible for later column changes. Keep the custom migration from the issue (`CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)` and `add_continuous_aggregate_policy`) and, if you query the view, declare it with Drizzle's `materializedView(...).existing()`.
+- The time column cannot be an integer. Integer time needs `set_integer_now_func` and integer chunk sizes, and the policies below are intervals.
+- The time column cannot be changed. An existing space partition cannot be removed or pointed at a different column or partition count. `generate` throws. Move the data in a migration you write. The down file for a migration that only added a space partition leaves that dimension in place.
+- Clearing `chunkTimeInterval` is not generated. Set the new interval. The down file for a migration that set an interval for the first time leaves that interval in place.
+- Removing `hypertable()` while the Drizzle table stays is an error. This package will not pretend it turned the hypertable back into a regular table. Remove the table from the Drizzle schema in the same change and `drizzle-kit` drops it, or drop it in a custom migration.
+- Down SQL removes policies and turns compression off. It leaves the hypertable in place, and it does not `DROP EXTENSION timescaledb` while that hypertable still exists, because the drop would fail. `ALTER TABLE ... SET (timescaledb.compress = false)` fails if a chunk is already compressed. Decompress those chunks yourself first. `drizzle-kit migrate` does not run the down file.
+- `create_hypertable` errors with `table "..." is not empty` unless `migrateData: true`. Migrating data takes a lock and rewrites the rows into chunks.
+- Compression is emitted as `timescaledb.compress`, `timescaledb.compress_segmentby`, `timescaledb.compress_orderby`, and `add_compression_policy`. Current TimescaleDB still accepts those names and treats them as the columnstore. This package does not emit `timescaledb.enable_columnstore` or `add_columnstore_policy`.
+- No `by_range()` / `by_hash()`, reorder policies, retention `drop_created_before`, compression `compress_created_before`, tablespaces, or sparse indexes.
+- `create_hypertable` still creates its default index on the time column. That index is not in the Drizzle schema.
+- Chunks live in `_timescaledb_internal`, next to the `_timescaledb_catalog` and `_timescaledb_config` schemas. `drizzle-kit push` and `drizzle-kit pull` can treat those as tables you forgot to declare. `generate` does not. The supported path is generate, then migrate.
+- A later drizzle-kit migration that drops and recreates the parent (some column type changes) drops the hypertable with it. The extras snapshot already says the table is a hypertable, so this package will not emit `create_hypertable` again. Repair that kit migration by hand.
+- A `{ name, schema }` parent skips the NOT NULL, type, and unique-index checks.
+
 ## drizzle-kit push
 
-`drizzle-kit push` does not read this package and does not run files in the migrations folder. It will not create functions, triggers, comments, extensions, or partitions.
+`drizzle-kit push` does not read this package and does not run files in the migrations folder. It will not create functions, triggers, comments, extensions, partitions, or hypertables.
 
-Kit 0.31 has no trigger diff, so push does not drop a trigger it never declared. A push that drops or recreates the table still drops that table's triggers and comments, because Postgres drops them with the table. Functions are not attached to the table and stay. Extensions are not created. An extension that installs its own tables (PostGIS) can show up as relations push wants to delete; set `extensionsFilters: ["postgis"]` in `drizzle.config.ts` for that case. Partition children show up the same way: they are tables in the database that are not in the Drizzle schema, and push can try to drop them. Exclude those names with `tablesFilter` if you push, or don't push.
+Kit 0.31 has no trigger diff, so push does not drop a trigger it never declared. A push that drops or recreates the table still drops that table's triggers and comments, because Postgres drops them with the table. Functions are not attached to the table and stay. Extensions are not created. An extension that installs its own tables (PostGIS) can show up as relations push wants to delete; set `extensionsFilters: ["postgis"]` in `drizzle.config.ts` for that case. Partition children show up the same way: they are tables in the database that are not in the Drizzle schema, and push can try to drop them. Timescale chunks and catalog tables show up the same way. Exclude those names with `tablesFilter` if you push, or don't push.
 
 The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`, then `drizzle-kit migrate`. If you use push for tables, apply the extras yourself with `renderIdempotent` (or by running the latest up file) after a push that recreated a table.
 
@@ -339,16 +402,17 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 
 | | |
 | --- | --- |
-| drizzle-orm | `>=0.36.4`. Tested with 0.45.3. Drizzle 0.45 and v1.0.0-rc.5 still do not generate functions, triggers, comments, extensions, or partitions. |
+| drizzle-orm | `>=0.36.4`. Tested with 0.45.3. Drizzle 0.45 and v1.0.0-rc.5 still do not generate functions, triggers, comments, extensions, partitions, or hypertables. |
 | drizzle-kit | `>=0.31.0` journal format. Tested with 0.31.11: `migrate` applies the file, and the next `generate` reports no schema changes. |
 | drizzle-kit 1.0 rc | Writes a v1 folder when one is already present. Delta snapshots in rc.5 are not rewritten; treat that layout as untested beyond the file names. |
 | PostgreSQL | 14 or newer (`CREATE OR REPLACE TRIGGER`). Tested on 16. |
+| TimescaleDB | Hypertables, compression settings, retention policies, and compression policies. Tested with TimescaleDB 2.32 on PostgreSQL 16. CI uses `timescale/timescaledb:latest-pg16`. |
 | Node.js | 18 or newer. ESM and CJS builds. |
 
 ## What it does not do yet
 
 - Row level security policies. drizzle-kit already generates policies. The partition conversion copies policies that already exist on a parent; it does not author new ones.
-- Creating views and materialized views. drizzle-kit does that. This package comments them and can put triggers on a view.
+- Creating views and materialized views. drizzle-kit does that. This package comments them and can put triggers on a view. Timescale continuous aggregates are included in that, on purpose. See [Timescale limits](#timescale-limits).
 - `DEFERRABLE` on `UNIQUE` and foreign keys. Deferrable constraint triggers are in [Triggers](#triggers).
 - `OUT`, `INOUT`, and `VARIADIC` function arguments. Function comments use the `IN` argument types.
 - Comments on policies, sequences, rules, or individual enum labels.
@@ -378,7 +442,7 @@ npm run typecheck
 npm run lint
 ```
 
-Unit tests cover SQL generation and the snapshot diff, including comments, trigger rules, and partition bounds. `POSTGRES_URL` points the integration tests at a real Postgres. One runs `drizzle-kit migrate`, checks that the trigger fires, and that comments on the table, column, enum, view, function, trigger, index, constraint, and extension exist. Another checks a deferred constraint trigger, transition tables, `INSTEAD OF` on a view, `UPDATE OF` / `WHEN`, and `DISABLE TRIGGER`. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. CI uses a Postgres 16 service container.
+Unit tests cover SQL generation and the snapshot diff, including comments, trigger rules, partition bounds, and hypertable SQL. `POSTGRES_URL` points the Postgres integration tests at a real server. One runs `drizzle-kit migrate`, checks that the trigger fires, and that comments on the table, column, enum, view, function, trigger, index, constraint, and extension exist. Another checks a deferred constraint trigger, transition tables, `INSTEAD OF` on a view, `UPDATE OF` / `WHEN`, and `DISABLE TRIGGER`. The partition test checks range, list, and hash routing, attach, the empty-table guard, and the down file. `TIMESCALE_URL` points the Timescale test at a server with the extension. It checks `create_hypertable`, compression, both policies, a second generate that changes the chunk interval, the down file, and that `drizzle-kit generate` reports no schema changes. CI keeps the Postgres 16 job as it was and runs the Timescale test in a separate job on `timescale/timescaledb:latest-pg16`.
 
 ## License
 

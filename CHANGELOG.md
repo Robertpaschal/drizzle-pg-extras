@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+TimescaleDB hypertables, for [drizzle-orm#2962](https://github.com/drizzle-team/drizzle-orm/issues/2962).
+
+- `hypertable()` appends `create_hypertable(..., if_not_exists => TRUE)` for a table drizzle-kit already created. Optional `chunkTimeInterval`, `partitioningColumn` / `numberPartitions`, and `migrateData`.
+- Optional compression settings, `add_retention_policy`, and `add_compression_policy`.
+- `pgExtension("timescaledb")` is required. `generate` throws if it is not in the schema.
+- Continuous aggregates are not generated. This is a community package, not an official Timescale or Drizzle release.
+- `_pg-extras.json` from 0.4.0 still loads. Hypertable keys are added the next time a migration is written.
+
 ## 0.4.0
 
 The rest of `CREATE TRIGGER`, for [drizzle-orm#843](https://github.com/drizzle-team/drizzle-orm/issues/843) and the deferrable trigger case in [drizzle-orm#1429](https://github.com/drizzle-team/drizzle-orm/issues/1429).

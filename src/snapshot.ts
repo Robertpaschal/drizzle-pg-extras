@@ -32,6 +32,7 @@ import {
   type AnyPgEnum,
   type PgViewLike,
   type PartitionBound,
+  type Hypertable,
   type PartitionedTable,
   type PgComment,
   type PgDetach,
@@ -182,6 +183,42 @@ export type DetachSnapshot = {
   parentName: string;
 };
 
+export type HypertableOrderSnapshot = {
+  column: string;
+  direction: "asc" | "desc" | null;
+  nulls: "first" | "last" | null;
+};
+
+export type HypertableCompressionSnapshot = {
+  segmentBy: string[];
+  orderBy: HypertableOrderSnapshot[];
+};
+
+export type HypertableRetentionSnapshot = {
+  dropAfter: string;
+  scheduleInterval: string | null;
+};
+
+export type HypertableCompressionPolicySnapshot = {
+  compressAfter: string;
+  scheduleInterval: string | null;
+};
+
+export type HypertableSnapshot = {
+  id: string;
+  schema: string;
+  name: string;
+  timeColumn: string;
+  chunkTimeInterval: string | null;
+  partitioningColumn: string | null;
+  numberPartitions: number | null;
+  /** Used only by the create_hypertable statement. Changing it later does not write a migration. */
+  migrateData: boolean;
+  compression: HypertableCompressionSnapshot | null;
+  retention: HypertableRetentionSnapshot | null;
+  compressionPolicy: HypertableCompressionPolicySnapshot | null;
+};
+
 export type Snapshot = {
   version: 1;
   functions: FunctionSnapshot[];
@@ -191,6 +228,7 @@ export type Snapshot = {
   partitionedTables: PartitionedTableSnapshot[];
   partitions: PartitionSnapshot[];
   detaches: DetachSnapshot[];
+  hypertables: HypertableSnapshot[];
   inventory: {
     scanned: boolean;
     tables: InventoryTable[];
@@ -211,6 +249,7 @@ export function emptySnapshot(): Snapshot {
     partitionedTables: [],
     partitions: [],
     detaches: [],
+    hypertables: [],
     inventory: { scanned: false, tables: [], enums: [], views: [], indexes: [], constraints: [] },
   };
 }
@@ -331,6 +370,7 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
   const partitionedTables = snapshotPartitionedTables(extras, nameOf);
   const partitions = snapshotPartitions(extras, partitionedTables);
   const detaches = snapshotDetaches(extras, partitions);
+  const hypertables = snapshotHypertables(extras, nameOf, partitionedTables, extensions);
 
   functions.sort((a, b) => a.id.localeCompare(b.id));
   triggers.sort((a, b) => a.id.localeCompare(b.id));
@@ -339,6 +379,7 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
   partitionedTables.sort((a, b) => a.id.localeCompare(b.id));
   partitions.sort((a, b) => a.id.localeCompare(b.id));
   detaches.sort((a, b) => a.id.localeCompare(b.id));
+  hypertables.sort((a, b) => a.id.localeCompare(b.id));
 
   const triggerIds = new Set<string>();
   for (const trigger of triggers) {
@@ -357,6 +398,7 @@ export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }):
     partitionedTables,
     partitions,
     detaches,
+    hypertables,
     inventory: {
       scanned: true,
       tables: inventoryTables,
@@ -688,6 +730,7 @@ export function parseSnapshot(value: unknown): Snapshot {
     partitionedTables: record.partitionedTables ?? [],
     partitions: record.partitions ?? [],
     detaches: record.detaches ?? [],
+    hypertables: record.hypertables ?? [],
     inventory: normalizeInventory(record.inventory),
   };
 }
@@ -1091,6 +1134,59 @@ function uniqueNames(items: readonly { schema: string; name: string }[]): Invent
   }
   names.sort((a, b) => `${a.schema}.${a.name}`.localeCompare(`${b.schema}.${b.name}`));
   return names;
+}
+
+function snapshotHypertables(
+  extras: PgExtras,
+  nameOf: (column: AnyPgColumn) => string,
+  parents: readonly PartitionedTableSnapshot[],
+  extensions: readonly ExtensionSnapshot[],
+): HypertableSnapshot[] {
+  const hypertables: HypertableSnapshot[] = [];
+  for (const hypertable of extras.hypertables) {
+    const snap = snapshotHypertable(hypertable, nameOf);
+    if (hypertables.some((item) => item.id === snap.id)) {
+      throw new PgExtrasError(`hypertable ${snap.schema}.${snap.name} is declared more than once`);
+    }
+    if (parents.some((item) => item.schema === snap.schema && item.name === snap.name)) {
+      throw new PgExtrasError(`${snap.schema}.${snap.name} cannot be both a partitioned table and a hypertable`);
+    }
+    hypertables.push(snap);
+  }
+  if (hypertables.length > 0 && !extensions.some((ext) => ext.name === "timescaledb")) {
+    const names = hypertables.map((item) => `${item.schema}.${item.name}`).join(", ");
+    throw new PgExtrasError(
+      `hypertable() requires pgExtension("timescaledb") in the schema (${names}). Declare the extension and export it. generate writes CREATE EXTENSION before create_hypertable.`,
+    );
+  }
+  return hypertables;
+}
+
+function snapshotHypertable(hypertable: Hypertable, nameOf: (column: AnyPgColumn) => string): HypertableSnapshot {
+  const identity = tableIdentity(hypertable.table);
+  const columnName = (column: Hypertable["timeColumn"]) => (typeof column === "string" ? column : nameOf(column));
+  return {
+    id: JSON.stringify(["hypertable", identity.schema, identity.name]),
+    schema: identity.schema,
+    name: identity.name,
+    timeColumn: columnName(hypertable.timeColumn),
+    chunkTimeInterval: hypertable.chunkTimeInterval,
+    partitioningColumn: hypertable.partitioningColumn ? columnName(hypertable.partitioningColumn) : null,
+    numberPartitions: hypertable.numberPartitions,
+    migrateData: hypertable.migrateData,
+    compression: hypertable.compression
+      ? {
+          segmentBy: hypertable.compression.segmentBy.map(columnName),
+          orderBy: hypertable.compression.orderBy.map((order) => ({
+            column: columnName(order.column),
+            direction: order.direction,
+            nulls: order.nulls,
+          })),
+        }
+      : null,
+    retention: hypertable.retention ? { ...hypertable.retention } : null,
+    compressionPolicy: hypertable.compressionPolicy ? { ...hypertable.compressionPolicy } : null,
+  };
 }
 
 function snapshotPartitionedTables(
