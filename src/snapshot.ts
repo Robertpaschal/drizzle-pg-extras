@@ -1,10 +1,10 @@
-import { Column, SQL, getTableColumns, is, type Casing } from "drizzle-orm";
-import { CasingCache, toCamelCase, toSnakeCase } from "drizzle-orm/casing";
+import { Column, SQL, getTableColumns, is } from "drizzle-orm";
+import { toCamelCase, toSnakeCase } from "drizzle-orm/casing";
+import { ColumnCasing, columnTable, unwrapArrayColumn, type Casing } from "./compat.js";
 import {
   CheckBuilder,
   ForeignKeyBuilder,
   IndexBuilder,
-  PgArray,
   PgEnumColumn,
   PgEnumObjectColumn,
   PgTable,
@@ -260,7 +260,7 @@ export function functionSignature(schema: string, name: string, argTypes: readon
 
 export function snapshotExtras(extras: PgExtras, options?: { casing?: Casing }): Snapshot {
   const casing = options?.casing;
-  const cache = new CasingCache(casing);
+  const cache = new ColumnCasing(casing);
   const nameOf = (column: AnyPgColumn) => cache.getColumnCasing(column);
 
   const functions: FunctionSnapshot[] = [];
@@ -917,10 +917,11 @@ function columnCommentFrom(
   nameOf: (column: AnyPgColumn) => string,
   extras: PgExtras,
 ): CommentSnapshot {
-  if (!column.table || !is(column.table, PgTable)) {
+  const owner = columnTable(column);
+  if (!owner || !is(owner, PgTable)) {
     throw new PgExtrasError(`commentOn() column "${column.name}" is not attached to a Postgres table or view`);
   }
-  const identity = tableIdentity(column.table);
+  const identity = tableIdentity(owner);
   const dbName = nameOf(column);
   const knownTable = extras.tables.find((table) => {
     const id = tableIdentity(table);
@@ -935,7 +936,7 @@ function columnCommentFrom(
     const viewId = viewIdentity(view);
     return columnComment(viewId.schema, viewId.name, dbName, text);
   }
-  assertColumnOfTable(column.table, column);
+  assertColumnOfTable(owner, column);
   return columnComment(identity.schema, identity.name, dbName, text);
 }
 
@@ -1109,7 +1110,7 @@ function enumObjectsIn(extras: PgExtras): AnyPgEnum[] {
 
 function enumFromColumn(column: AnyPgColumn): AnyPgEnum | null {
   let current: object = column;
-  while (is(current, PgArray)) current = current.baseColumn;
+  current = unwrapArrayColumn(current);
   if (is(current, PgEnumColumn) || is(current, PgEnumObjectColumn)) return current.enum as AnyPgEnum;
   return null;
 }

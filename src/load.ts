@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import type { Casing } from "drizzle-orm";
+import type { Casing } from "./compat.js";
 import { collectExtras } from "./collect.js";
 import type { PgExtras } from "./defs.js";
 import { PgExtrasError } from "./errors.js";

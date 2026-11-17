@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
+import { migrationFile, migrationTags } from "../kit-version.js";
 import { splitMigrationSql } from "../../src/index.js";
 import { run } from "../../src/cli.js";
 
@@ -78,7 +79,7 @@ export default defineConfig({
       const migrate = kitExec(dir, ["migrate", "--config", "drizzle.config.ts"]);
       expect(migrate.status, migrate.stderr + migrate.stdout).toBe(0);
 
-      const upFile = path.join(dir, "drizzle", "0001_extras.sql");
+      const upFile = migrationFile(path.join(dir, "drizzle"), "extras");
       const upSql = readFileSync(upFile, "utf8");
       expect(upSql).toContain("CREATE OR REPLACE TRIGGER");
       expect(upSql).toContain("CREATE EXTENSION IF NOT EXISTS");
@@ -116,7 +117,7 @@ export default defineConfig({
       expect(again.stdout).toContain("No schema changes");
       expect(sqlFiles(path.join(dir, "drizzle"))).toEqual(before);
 
-      await runStatements(client, readFileSync(path.join(dir, "drizzle", "0001_extras.down.sql"), "utf8"));
+      await runStatements(client, readFileSync(migrationFile(path.join(dir, "drizzle"), "extras", "down"), "utf8"));
       const trigger = await client.query(
         "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE c.relname = 'users' AND NOT t.tgisinternal",
       );
@@ -226,7 +227,7 @@ export default defineConfig({
       const migrate = kitExec(dir, ["migrate", "--config", "drizzle.config.ts"]);
       expect(migrate.status, migrate.stderr + migrate.stdout).toBe(0);
 
-      const upSql = readFileSync(path.join(dir, "drizzle", "0001_comments.sql"), "utf8");
+      const upSql = readFileSync(migrationFile(path.join(dir, "drizzle"), "comments"), "utf8");
       expect(upSql).toContain("COMMENT ON TYPE");
       expect(upSql).toContain("COMMENT ON VIEW");
       expect(upSql).toContain("COMMENT ON MATERIALIZED VIEW");
@@ -290,7 +291,7 @@ export default defineConfig({
       expect(again.stdout).toContain("No schema changes");
       expect(sqlFiles(path.join(dir, "drizzle"))).toEqual(before);
 
-      await runStatements(client, readFileSync(path.join(dir, "drizzle", "0001_comments.down.sql"), "utf8"));
+      await runStatements(client, readFileSync(migrationFile(path.join(dir, "drizzle"), "comments", "down"), "utf8"));
       const cleared = await client.query<{
         enum_comment: string | null;
         view_comment: string | null;
@@ -338,5 +339,5 @@ async function runStatements(client: pg.Client, file: string): Promise<void> {
 }
 
 function sqlFiles(dir: string): string[] {
-  return readdirSync(dir).filter((file) => file.endsWith(".sql") && !file.endsWith(".down.sql")).sort();
+  return migrationTags(dir);
 }

@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
+import { migrationFile, migrationTags } from "../kit-version.js";
 import { splitMigrationSql } from "../../src/index.js";
 import { run } from "../../src/cli.js";
 
@@ -174,7 +175,7 @@ export default defineConfig({
       const migrate = kitExec(dir, ["migrate", "--config", "drizzle.config.ts"]);
       expect(migrate.status, migrate.stderr + migrate.stdout).toBe(0);
 
-      const upSql = readFileSync(path.join(dir, "drizzle", "0001_triggers.sql"), "utf8");
+      const upSql = readFileSync(migrationFile(path.join(dir, "drizzle"), "triggers"), "utf8");
       expect(upSql).toContain("CREATE CONSTRAINT TRIGGER");
       expect(upSql).toContain("DEFERRABLE INITIALLY DEFERRED");
       expect(upSql).toContain('FROM "public"."customers"');
@@ -239,7 +240,7 @@ export default defineConfig({
       process.chdir(dir);
       expect(await run(["generate", "--name", "tighten"])).toBe(0);
       process.chdir(cwd);
-      const changed = readFileSync(path.join(dir, "drizzle", "0002_tighten.sql"), "utf8");
+      const changed = readFileSync(migrationFile(path.join(dir, "drizzle"), "tighten"), "utf8");
       expect(changed).toContain("DEFERRABLE INITIALLY IMMEDIATE");
       expect(changed).toContain('ENABLE TRIGGER "profiles_guard"');
       expect(changed).not.toContain("ledger_inserted");
@@ -316,5 +317,5 @@ async function triggerCatalog(client: pg.Client): Promise<Map<string, {
 }
 
 function sqlFiles(dir: string): string[] {
-  return readdirSync(dir).filter((file) => file.endsWith(".sql") && !file.endsWith(".down.sql")).sort();
+  return migrationTags(dir);
 }

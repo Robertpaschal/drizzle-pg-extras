@@ -1,4 +1,4 @@
-import type { Casing } from "drizzle-orm";
+import type { Casing } from "./compat.js";
 import { diffSnapshots, idempotentStatements } from "./diff.js";
 import type { PgExtras } from "./defs.js";
 import { PgExtrasError } from "./errors.js";

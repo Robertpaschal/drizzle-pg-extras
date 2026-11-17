@@ -5,6 +5,7 @@ import { sql } from "drizzle-orm";
 import { integer, pgSchema, pgTable, text, timestamp } from "drizzle-orm/pg-core";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { describe, expect, it } from "vitest";
+import { KIT_MAJOR } from "../kit-version.js";
 import {
   commentOn,
   defineExtras,
@@ -279,8 +280,9 @@ describe("definition checks", () => {
   });
 });
 
+// drizzle-kit 1.0 reads only folder-per-migration; the journal layout needs `drizzle-kit up` there.
 describe("migration files", () => {
-  it("appends a journal entry and a kit snapshot drizzle can read", () => {
+  it.skipIf(KIT_MAJOR >= 1)("appends a journal entry and a kit snapshot drizzle can read", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "pg-extras-"));
     const extras = defineExtras({ extensions: [pgExtension("pgcrypto")] });
     const first = generate({ extras, out: dir, name: "Add pgcrypto" });
@@ -334,5 +336,27 @@ describe("migration files", () => {
     expect(copied.id).not.toBe("prev-id");
     expect(copied.tables.keep).toBe(true);
     expect(readdirSync(dir).some((entry) => entry === "meta")).toBe(false);
+  });
+
+  it("chains a drizzle-kit 1.0 diff snapshot after the last one, even in the same second", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pg-extras-kit1-"));
+    const stamp = new Date().toISOString().replace(/[-T:]/g, "").slice(0, 14);
+    const folder = path.join(dir, `${stamp}_users`);
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(path.join(folder, "migration.sql"), "-- table\n");
+    writeFileSync(
+      path.join(folder, "snapshot.json"),
+      JSON.stringify({ type: "base", version: "9", dialect: "postgres", id: "base-id", prevIds: ["00000000-0000-0000-0000-000000000000"], footprints: [], ddl: [{ kind: "table" }] }),
+    );
+    const result = generate({ extras: defineExtras({ extensions: [pgExtension("pgcrypto")] }), out: dir, name: "ext" });
+    expect(result.written).toBe(true);
+    if (!result.written) return;
+    expect(result.layout).toBe("v1");
+    // Must sort after the users folder, or drizzle-kit sees two base snapshots.
+    expect(result.tag > `${stamp}_users`).toBe(true);
+    const next = JSON.parse(readFileSync(path.join(path.dirname(result.sqlPath), "snapshot.json"), "utf8")) as Record<string, unknown>;
+    expect(next).toMatchObject({ type: "diff", version: "9", dialect: "postgres", prevIds: ["base-id"], footprints: [], deltas: [] });
+    expect(next.id).not.toBe("base-id");
+    expect(next).not.toHaveProperty("ddl");
   });
 });

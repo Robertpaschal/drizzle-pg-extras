@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -101,7 +102,30 @@ function detectLayout(out: string): "journal" | "v1" {
       `migrations folder ${out} has both meta/_journal.json and v1 migration folders. Keep one layout.`,
     );
   }
-  return v1.length > 0 ? "v1" : "journal";
+  if (v1.length > 0) return "v1";
+  if (journal) return "journal";
+  // An empty folder: follow the installed drizzle-kit. 1.0 only reads folder-per-migration.
+  return installedKitMajor() >= 1 ? "v1" : "journal";
+}
+
+function installedKitMajor(): number {
+  for (const name of ["drizzle-kit", "drizzle-orm"]) {
+    try {
+      const require = createRequire(path.join(process.cwd(), "noop.js"));
+      let dir = path.dirname(require.resolve(name));
+      for (let i = 0; i < 6; i += 1) {
+        const pkgPath = path.join(dir, "package.json");
+        if (existsSync(pkgPath)) {
+          const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { name?: string; version?: string };
+          if (pkg.name === name && pkg.version) return Number.parseInt(pkg.version, 10);
+        }
+        dir = path.dirname(dir);
+      }
+    } catch {
+      // not installed from this project; try the next one
+    }
+  }
+  return 0;
 }
 
 function writeJournal(out: string, input: WriteMigrationInput): WrittenMigration {
@@ -144,9 +168,13 @@ function writeV1(out: string, input: WriteMigrationInput): WrittenMigration {
     .sort();
   const suffix = sanitizeMigrationName(input.name);
   let stamp = utcStamp(new Date());
+  // drizzle-kit orders v1 folders by name, so this one must sort after the last one,
+  // even when both were written in the same second.
+  const lastStamp = folders.length > 0 ? folders[folders.length - 1]!.slice(0, 14) : null;
+  if (lastStamp && stamp <= lastStamp) stamp = bumpStamp(lastStamp);
   let folder = `${stamp}_${suffix}`;
   while (existsSync(path.join(out, folder))) {
-    stamp = String(Number(stamp) + 1);
+    stamp = bumpStamp(stamp);
     folder = `${stamp}_${suffix}`;
   }
   const dir = path.join(out, folder);
@@ -160,8 +188,22 @@ function writeV1(out: string, input: WriteMigrationInput): WrittenMigration {
     const parsed = JSON.parse(readFileSync(previous, "utf8")) as Record<string, unknown>;
     let next: Record<string, unknown> = parsed;
     if (typeof parsed.id === "string") {
-      const { id, prevId: _previous, ...rest } = parsed;
-      next = { id: randomUUID(), prevId: id, ...rest };
+      if (parsed.type === "base" || parsed.type === "diff") {
+        // drizzle-kit 1.0 stores one base snapshot, then diffs chained through prevIds.
+        // This is what `drizzle-kit generate --custom` writes for a migration with no schema change.
+        next = {
+          type: "diff",
+          version: parsed.version,
+          dialect: parsed.dialect,
+          id: randomUUID(),
+          prevIds: [parsed.id],
+          footprints: [],
+          deltas: [],
+        };
+      } else {
+        const { id, prevId: _previous, ...rest } = parsed;
+        next = { id: randomUUID(), prevId: id, ...rest };
+      }
     }
     writeFileSync(path.join(dir, "snapshot.json"), `${JSON.stringify(next, null, 2)}\n`);
   }
@@ -225,4 +267,17 @@ function migrationPrefix(idx: number, mode: MigrationPrefix): string {
 function utcStamp(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`;
+}
+
+/** The next YYYYMMDDHHMMSS stamp after this one, as a real UTC time (no "…60" seconds). */
+function bumpStamp(stamp: string): string {
+  const at = Date.UTC(
+    Number(stamp.slice(0, 4)),
+    Number(stamp.slice(4, 6)) - 1,
+    Number(stamp.slice(6, 8)),
+    Number(stamp.slice(8, 10)),
+    Number(stamp.slice(10, 12)),
+    Number(stamp.slice(12, 14)),
+  );
+  return utcStamp(new Date(at + 1000));
 }
