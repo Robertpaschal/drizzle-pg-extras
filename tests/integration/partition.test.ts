@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
+import { migrationFile, migrationTags } from "../kit-version.js";
 import { convertPartitionedTableSql, splitMigrationSql } from "../../src/index.js";
 import { run } from "../../src/cli.js";
 
@@ -176,7 +177,7 @@ export default defineConfig({
       const migrate = kitExec(dir, ["migrate", "--config", "drizzle.config.ts"]);
       expect(migrate.status, migrate.stderr + migrate.stdout).toBe(0);
 
-      const upPath = path.join(dir, "drizzle", "0001_partitions.sql");
+      const upPath = migrationFile(path.join(dir, "drizzle"), "partitions");
       const upSql = readFileSync(upPath, "utf8");
       expect(upSql).toContain('RANGE ("created_at")');
       expect(upSql).toContain('LIST ("locale")');
@@ -234,7 +235,7 @@ export default defineConfig({
       await client.query("DELETE FROM events");
       await client.query("DELETE FROM labels");
       await client.query("DELETE FROM tickets");
-      await runStatements(client, readFileSync(path.join(dir, "drizzle", "0001_partitions.down.sql"), "utf8"));
+      await runStatements(client, readFileSync(migrationFile(path.join(dir, "drizzle"), "partitions", "down"), "utf8"));
 
       const kinds = await client.query<{ relname: string; relkind: string }>(
         `SELECT c.relname, c.relkind
@@ -378,5 +379,5 @@ async function runStatements(client: pg.Client, file: string): Promise<void> {
 }
 
 function sqlFiles(dir: string): string[] {
-  return readdirSync(dir).filter((file) => file.endsWith(".sql") && !file.endsWith(".down.sql")).sort();
+  return migrationTags(dir);
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+Drizzle 1.0 support, for [#6](https://github.com/Robertpaschal/drizzle-pg-extras/issues/6).
+
+- Works with `drizzle-orm` and `drizzle-kit` 1.0 (tested on `1.0.0-rc.5`) as well as 0.x. The peer ranges now admit 1.0 prereleases.
+- Internals that moved in 1.0 go through a small compatibility layer: `Casing` and `CasingCache` (gone from `drizzle-orm` / `drizzle-orm/casing`), `PgDialect`'s `casing` option, `PgArray` (now `dimensions` on the column), and the untyped `column.table`. `withComment()` accepts 1.0 column builders, which no longer extend `ColumnBuilder` at runtime.
+- drizzle-kit 1.0 folders: the new migration's `snapshot.json` is an empty `diff` chained through `prevIds`, the same thing `drizzle-kit generate --custom` writes, instead of a copy of the previous snapshot. The folder name always sorts after the last one, even within the same second, so kit never reports two base snapshots.
+- An empty migrations folder follows the installed drizzle-kit: folder-per-migration for 1.0, the journal for 0.x.
+- CI runs the suite against drizzle 0.x on Node 18 and 22, and against the 1.0 release candidate on Node 22.
+
 ## 0.5.0
 
 TimescaleDB hypertables, for [drizzle-orm#2962](https://github.com/drizzle-team/drizzle-orm/issues/2962).

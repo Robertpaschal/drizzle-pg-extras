@@ -5,16 +5,16 @@ import {
   is,
   sql,
   Table,
-  type Casing,
   type ColumnBuilderBase,
   type SQL,
 } from "drizzle-orm";
-import { CasingCache } from "drizzle-orm/casing";
+import { ColumnCasing, columnTable, type Casing } from "./compat.js";
 import {
   CheckBuilder,
   ForeignKeyBuilder,
   IndexBuilder,
   IndexBuilderOn,
+  PgColumnBuilder,
   ManualMaterializedViewBuilder,
   ManualViewBuilder,
   MaterializedViewBuilder,
@@ -358,7 +358,8 @@ export function withComment(target: unknown, comment: string): unknown {
     stampDirect(target, text);
     return target;
   }
-  if (is(target, Column) || is(target, ColumnBuilder)) {
+  // 1.0's PgColumnBuilder no longer extends ColumnBuilder at runtime.
+  if (is(target, Column) || is(target, ColumnBuilder) || is(target, PgColumnBuilder)) {
     stampConfig(target, text);
     return target;
   }
@@ -725,7 +726,7 @@ function viewOwnsColumn(view: PgViewLike, column: AnyPgColumn, viewName: string)
   const entries = relationColumnEntries(view);
   if (entries.some(([, owned]) => owned === column)) return true;
   // pgView() column access returns a fresh alias of the view's column, not the selectedFields object.
-  const parent = column.table;
+  const parent = columnTable(column);
   if (!is(parent, PgTable) || getTableConfig(parent).name !== viewName) return false;
   return entries.some(([, owned]) => owned.name === column.name);
 }
@@ -862,7 +863,7 @@ function renderWhenInput(label: string, table: TriggerRelation, when: WhenInput 
 }
 
 function rowProxy(columns: readonly [string, AnyPgColumn][], alias: "NEW" | "OLD", casing: Casing | undefined): Record<string, SQL> {
-  const cache = new CasingCache(casing);
+  const cache = new ColumnCasing(casing);
   const refs: Record<string, SQL> = {};
   for (const [key, column] of columns) {
     refs[key] = sql.raw(`${alias}.${quoteIdent(cache.getColumnCasing(column))}`);

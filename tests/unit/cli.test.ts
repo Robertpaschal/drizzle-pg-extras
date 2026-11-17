@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { run } from "../../src/cli.js";
+import { KIT_MAJOR } from "../kit-version.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.tmp");
 
@@ -30,7 +31,13 @@ export const users = withComment(pgTable("users", {
     process.chdir(dir);
     try {
       expect(await run(["generate", "--name", "init"])).toBe(0);
-      const sql = readFileSync(path.join(dir, "drizzle", "0000_init.sql"), "utf8");
+      // drizzle-kit 1.0 projects get a folder per migration; 0.x projects get the journal layout.
+      const out = path.join(dir, "drizzle");
+      const sqlFile =
+        KIT_MAJOR >= 1
+          ? path.join(out, readdirSync(out).find((entry) => entry.endsWith("_init"))!, "migration.sql")
+          : path.join(out, "0000_init.sql");
+      const sql = readFileSync(sqlFile, "utf8");
       expect(sql).toContain('CREATE EXTENSION IF NOT EXISTS "pgcrypto";');
       expect(sql).toContain('COMMENT ON TABLE "public"."users" IS \'users\';');
       expect(sql).toContain('COMMENT ON COLUMN "public"."users"."email" IS \'email\';');

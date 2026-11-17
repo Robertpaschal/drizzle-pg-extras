@@ -68,7 +68,7 @@ The first `generate` writes a migration. The next one writes nothing until a def
 npm install drizzle-pg-extras
 ```
 
-Peer dependency: `drizzle-orm` `>=0.36.4`. `drizzle-kit` `>=0.31.0` is optional and only needed to apply migrations. Node.js 18 or newer.
+Peer dependency: `drizzle-orm` `>=0.36.4`, including 1.0 (tested with 0.45 and `1.0.0-rc.5`). `drizzle-kit` `>=0.31.0` or 1.0 is optional and only needed to apply migrations. Node.js 18 or newer.
 
 Put the definitions in the same files your `drizzle.config.ts` `schema` already points at, and export them. The CLI reads that config (dialect, schema, `out`, `casing`, `breakpoints`, `migrations.prefix`).
 
@@ -105,7 +105,17 @@ Up SQL is split on `--> statement-breakpoint`, which is what `drizzle-kit migrat
 
 Down SQL is the reverse diff: restore the previous function body, drop a trigger that was added, `COMMENT … IS NULL` for a comment that was removed. `drizzle-kit migrate` does not run `.down.sql`, and applying it does not delete the row in `__drizzle_migrations`. To roll back, run the down file yourself, then remove that journal entry and the matching migration row if kit's history should forget it too.
 
-If the migrations folder is already the v1 shape (timestamp directories that each contain `migration.sql`), `generate` writes another directory with `migration.sql`, `down.sql`, and a copied `snapshot.json`. That path is best-effort. rc.5 stores later snapshots as deltas; copying a delta forward can confuse the next `drizzle-kit generate`. The layout covered by the tests is the 0.31 journal.
+With drizzle-kit 1.0, migrations are one folder each (a timestamp directory with `migration.sql`). `generate` writes the same shape: a new directory with `migration.sql`, `down.sql`, and a `snapshot.json` that is an empty diff chained to the previous snapshot (`type: "diff"`, `prevIds` pointing at it), which is what `drizzle-kit generate --custom` writes. The directory always sorts after the last one, so kit never sees two base snapshots. An empty migrations folder gets the layout of the drizzle-kit installed in your project. Both layouts are covered by the test suite, against drizzle-kit 0.31 and 1.0.0-rc.5, including `drizzle-kit migrate` on Postgres.
+
+```
+drizzle/
+  20261118090000_users/        written by drizzle-kit generate
+  20261118090100_pg_extras/
+    migration.sql              applied by drizzle-kit migrate
+    down.sql                   not applied by drizzle-kit
+    snapshot.json              empty diff, prevIds -> the users snapshot
+  _pg-extras.json              full extras snapshot, commit this
+```
 
 ## Programmatic API
 
@@ -402,9 +412,9 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 
 | | |
 | --- | --- |
-| drizzle-orm | `>=0.36.4`. Tested with 0.45.3. Drizzle 0.45 and v1.0.0-rc.5 still do not generate functions, triggers, comments, extensions, partitions, or hypertables. |
+| drizzle-orm | `>=0.36.4` and 1.0. Tested with 0.45.3 and 1.0.0-rc.5. Drizzle 0.45 and v1.0.0-rc.5 still do not generate functions, triggers, comments, extensions, partitions, or hypertables. |
 | drizzle-kit | `>=0.31.0` journal format. Tested with 0.31.11: `migrate` applies the file, and the next `generate` reports no schema changes. |
-| drizzle-kit 1.0 rc | Writes a v1 folder when one is already present. Delta snapshots in rc.5 are not rewritten; treat that layout as untested beyond the file names. |
+| drizzle-kit 1.0 rc | Writes the folder-per-migration layout with an empty diff snapshot, tested through `drizzle-kit generate`, `check` and `migrate` on 1.0.0-rc.5. A drizzle-kit 0.x journal folder still gets journal entries; upgrade it with `drizzle-kit up` before moving to 1.0. |
 | PostgreSQL | 14 or newer (`CREATE OR REPLACE TRIGGER`). Tested on 16. |
 | TimescaleDB | Hypertables, compression settings, retention policies, and compression policies. Tested with TimescaleDB 2.32 on PostgreSQL 16. CI uses `timescale/timescaledb:latest-pg16`. |
 | Node.js | 18 or newer. ESM and CJS builds. |

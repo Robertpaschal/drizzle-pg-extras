@@ -1,6 +1,6 @@
 {
   "name": "drizzle-pg-extras",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Declare Postgres functions, triggers, extensions, partitioned tables, comments, and TimescaleDB hypertables next to a Drizzle schema and generate SQL migrations.",
   "type": "module",
   "license": "MIT",
@@ -60,8 +60,8 @@
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "drizzle-kit": ">=0.31.0",
-    "drizzle-orm": ">=0.36.4"
+    "drizzle-kit": ">=0.31.0 || >=1.0.0-0",
+    "drizzle-orm": ">=0.36.4 || >=1.0.0-0"
   },
   "peerDependenciesMeta": {
     "drizzle-kit": {

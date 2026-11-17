@@ -1,5 +1,6 @@
-import { is, SQL, type Casing } from "drizzle-orm";
+import { is, SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
+import { dialectConfig, type Casing } from "./compat.js";
 
 const dialects = new Map<string, PgDialect>();
 
@@ -7,7 +8,8 @@ function dialectFor(casing: Casing | undefined): PgDialect {
   const key = casing ?? "";
   let dialect = dialects.get(key);
   if (!dialect) {
-    dialect = new PgDialect(casing ? { casing } : undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    dialect = new PgDialect(dialectConfig(casing) as any);
     dialects.set(key, dialect);
   }
   return dialect;
