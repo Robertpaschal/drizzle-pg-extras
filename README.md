@@ -58,7 +58,7 @@ export const touchUsers = pgTrigger("users_set_updated_at", {
 });
 ```
 
-`columns` is `UPDATE OF`. `when` is checked when the trigger is declared. Constraint triggers, transition tables, `INSTEAD OF` on a view, and `enabled: false` are in [Triggers](#triggers).
+`columns` is `UPDATE OF`. `when` is rendered to text and scanned when `pgTrigger` runs. [Triggers](#triggers) lists what that scan rejects and what is left for Postgres. Constraint triggers, transition tables, `INSTEAD OF` on a view, and `enabled: false` are in that section too.
 
 The first `generate` writes a migration. The next one writes nothing until a definition changes. Only the difference is emitted, and the statements themselves are idempotent (`CREATE OR REPLACE`, `IF NOT EXISTS`, `DROP … IF EXISTS`).
 
@@ -247,6 +247,8 @@ export const profilesGuard = pgTrigger("profiles_guard", {
 
 `withComment` on a trigger still emits `COMMENT ON TRIGGER ... ON table`. A normal `CREATE OR REPLACE` keeps that comment. A constraint trigger that is dropped and created gets the comment statement again.
 
+`when` is a string or a `sql` fragment, or, on a Drizzle table, `({ OLD, NEW }) => sql\`…\`` (the callback may return a string). TypeScript types `OLD` and `NEW` as that table's columns. The callback inserts each column as `OLD."name"` or `NEW."name"`. A string is used as written. A `sql` fragment is rendered to text. Neither is compared to the table's columns, and the expression is not checked as a boolean. `pgTrigger` renders the clause, omits an empty one, and strips a trailing `;`. It throws if a `;` is still present, if the trigger is `INSTEAD OF`, or if a scan of the text finds the word `SELECT` or `EXISTS`, the word `OLD` or `NEW` on a statement trigger, `OLD` when the events include `INSERT`, or `NEW` when the events include `DELETE`. The scan skips comments, quoted strings, quoted identifiers, and dollar quotes, and it does not parse SQL. The snapshot render runs that scan again, with the same casing rules as the rest of the snapshot. The stored text is written as `WHEN ( ... )`. Postgres reports any other error when the migration runs.
+
 ### Trigger limits
 
 - Constraint triggers are `AFTER` and `FOR EACH ROW` on a table. `WHEN` on one is evaluated when the row changes, including when the trigger itself is deferred.
@@ -254,7 +256,7 @@ export const profilesGuard = pgTrigger("profiles_guard", {
 - Transition tables are `AFTER` triggers on tables, with one of `INSERT`, `UPDATE`, or `DELETE`. They cannot be combined with `UPDATE OF`, `TRUNCATE`, a constraint trigger, or a view.
 - `INSTEAD OF` is a view trigger, `FOR EACH ROW`, without `WHEN`, without `UPDATE OF`, and without `TRUNCATE`.
 - `BEFORE` and `AFTER` on a view are `forEach: "statement"`. Materialized views cannot have triggers.
-- `WHEN` cannot contain a subquery. An `INSERT` trigger cannot read `OLD`. A `DELETE` trigger cannot read `NEW`. A statement trigger cannot read `OLD` or `NEW`.
+- `WHEN` is the text scan above: the words `SELECT` or `EXISTS`, `OLD` or `NEW` on a statement trigger, `OLD` when the events include `INSERT`, and `NEW` when the events include `DELETE`.
 - `ALTER TABLE ... DISABLE TRIGGER` does not work on a view, so `enabled: false` is rejected for views and for `INSTEAD OF`. `ENABLE REPLICA` and `ENABLE ALWAYS` are not emitted.
 - A `{ name, schema }` relation skips the checks that need a Drizzle table or view. Postgres still rejects a view trigger that was declared as a table.
 - Row-level transition triggers on a partition are rejected by Postgres when the migration runs. Foreign tables are not detected through `{ name, schema }`.
@@ -406,7 +408,13 @@ A later `drizzle-kit generate` still diffs your tables and reports no schema cha
 
 Kit 0.31 has no trigger diff, so push does not drop a trigger it never declared. A push that drops or recreates the table still drops that table's triggers and comments, because Postgres drops them with the table. Functions are not attached to the table and stay. Extensions are not created. An extension that installs its own tables (PostGIS) can show up as relations push wants to delete; set `extensionsFilters: ["postgis"]` in `drizzle.config.ts` for that case. Partition children show up the same way: they are tables in the database that are not in the Drizzle schema, and push can try to drop them. Timescale chunks and catalog tables show up the same way. Exclude those names with `tablesFilter` if you push, or don't push.
 
-The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`, then `drizzle-kit migrate`. If you use push for tables, apply the extras yourself with `renderIdempotent` (or by running the latest up file) after a push that recreated a table.
+The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`, then `drizzle-kit migrate`. If you use push for tables, apply the extras yourself with `renderIdempotent` (or by running the latest up file) after a push that recreated a table. See [Known limitations](#known-limitations).
+
+## Known limitations
+
+`generate` and `check` diff the current declarations against `_pg-extras.json`. They do not read the database catalog. When drizzle-kit drops and recreates a table, Postgres drops the triggers and comments on that table. The snapshot still contains them, and the schema still declares them, so the next `generate` writes nothing for them. Functions are not attached to the table and stay. Partitions and hypertables are the same kind of gap; see [Partition limits](#partition-limits) and [Timescale limits](#timescale-limits).
+
+`renderIdempotent(extras)` snapshots the declarations you pass and prints idempotent SQL for them. Functions and ordinary triggers are `CREATE OR REPLACE`. A constraint trigger is `DROP TRIGGER IF EXISTS` plus `CREATE`. `enabled: false` adds `DISABLE TRIGGER`. Comments are `COMMENT ON`. Extensions are `CREATE EXTENSION IF NOT EXISTS`. Partitions are the conversion, create, attach, and detach statements. Hypertables are `create_hypertable` with `if_not_exists`, plus the compression `ALTER TABLE` and policy calls with `if_not_exists` when those are set. It does not drop objects removed from the schema. Run that script once the table exists again. An up file only repeats its own diff, so the latest up file recreates a trigger only when that `CREATE` is in the file.
 
 ## Compatibility
 
@@ -430,7 +438,7 @@ The supported path is `drizzle-kit generate`, then `drizzle-pg-extras generate`,
 - An index whose key is a SQL expression needs an explicit name before it can be commented. drizzle-kit requires that name too.
 - `updatedAtTrigger`'s generated function has no comment of its own. Comment the trigger, or declare the function with `pgFunction` and comment that.
 - Call `.as()` or `.existing()` before `withComment` on a view, and `.on()` before `withComment` on an index or unique constraint.
-- Pulling the live database back into the snapshot. The diff is against `_pg-extras.json`, not `pg_catalog`.
+- Pulling the live database back into the snapshot. The diff is against `_pg-extras.json`, not `pg_catalog`. See [Known limitations](#known-limitations).
 - MySQL, SQLite, and SingleStore.
 - Creating the schema named in `WITH SCHEMA`. The schema has to exist (drizzle-kit can create it).
 - Clearing an extension version pin, or moving an extension back to "no schema clause". Set the new version or schema explicitly. `ALTER EXTENSION … UPDATE` still depends on that extension shipping a downgrade path.
