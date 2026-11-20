@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+Docs only: the README explains how trigger `WHEN` clauses are checked and the snapshot gap after a table is recreated ([#8](https://github.com/Robertpaschal/drizzle-pg-extras/pull/8)). No code or API changes.
+
 ## 0.6.0
 
 Drizzle 1.0 support, for [#6](https://github.com/Robertpaschal/drizzle-pg-extras/issues/6).
