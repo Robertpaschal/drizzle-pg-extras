@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2
+
+Fix: the trigger `WHEN` scan now understands `E'...'` (and `U&'...'`) escape strings. Before, `\'` inside one was read as a doubled `''` pair, so the string never closed and the scan skipped the rest of the clause — an `INSERT` trigger `WHEN` like `NEW.note <> E'\'' OR OLD.status IS NULL` passed `generate` and Postgres rejected it at migrate. Reported by sunnatulla_dev on the "Five trigger WHEN clauses Postgres will reject" article.
+
 ## 0.6.1
 
 Docs only: the README explains how trigger `WHEN` clauses are checked and the snapshot gap after a table is recreated ([#8](https://github.com/Robertpaschal/drizzle-pg-extras/pull/8)). No code or API changes.

@@ -896,6 +896,31 @@ function whenReferences(whenSql: string): { old: boolean; new: boolean; subquery
   };
 }
 
+/**
+ * True when the quote at `quoteIndex` opens a Postgres escape string,
+ * `E'...'` or `U&'...'`. In those, a backslash escapes the next character,
+ * so `\'` is a literal quote and does not close the string. The prefix must
+ * stand alone: `someE'x'` is the identifier `someE` followed by a plain
+ * string, not an escape string.
+ */
+function isEscapeStringStart(input: string, quoteIndex: number): boolean {
+  const before = input[quoteIndex - 1];
+  if (before === "E" || before === "e") {
+    return !isIdentifierChar(input[quoteIndex - 2]);
+  }
+  if (before === "&") {
+    const u = input[quoteIndex - 2];
+    if (u === "U" || u === "u") {
+      return !isIdentifierChar(input[quoteIndex - 3]);
+    }
+  }
+  return false;
+}
+
+function isIdentifierChar(ch: string | undefined): boolean {
+  return ch !== undefined && /[A-Za-z0-9_$]/.test(ch);
+}
+
 function stripSqlNoise(input: string): string {
   let out = "";
   for (let i = 0; i < input.length; i++) {
@@ -915,8 +940,17 @@ function stripSqlNoise(input: string): string {
     }
     if (ch === "'") {
       out += " ";
+      const escapeString = isEscapeStringStart(input, i);
       i++;
       while (i < input.length) {
+        if (escapeString && input[i] === "\\") {
+          // In E'...' (and U&'...') a backslash escapes the next character,
+          // so \' is a literal quote. Without this, \' followed by the
+          // closing quote reads as a doubled '' pair and the string never
+          // closes, swallowing the rest of the clause.
+          i += 2;
+          continue;
+        }
         if (input[i] === "'" && input[i + 1] === "'") {
           i += 2;
           continue;
