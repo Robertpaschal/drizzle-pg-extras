@@ -10,7 +10,7 @@ export default defineConfig([
     external: [/^drizzle-orm/],
   },
   {
-    entry: { cli: "src/cli.ts" },
+    entry: { cli: "src/bin.ts" },
     format: ["esm"],
     dts: false,
     sourcemap: true,
