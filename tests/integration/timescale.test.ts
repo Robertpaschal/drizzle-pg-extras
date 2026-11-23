@@ -5,14 +5,13 @@ import { fileURLToPath } from "node:url";
 import { integer, pgTable, timestamp } from "drizzle-orm/pg-core";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
-import { migrationFile, migrationTags } from "../kit-version.js";
+import { KIT_BIN as kit, migrationFile, migrationTags } from "../kit-version.js";
 import { run } from "../../src/cli.js";
 import { splitMigrationSql } from "../../src/journal.js";
 import { createHypertableSql, defineExtras, hypertable, pgExtension, snapshotExtras, VERSION } from "../../src/index.js";
 
 const url = process.env.TIMESCALE_URL;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.tmp");
-const kit = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../node_modules/drizzle-kit/bin.cjs");
 const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../src/index.ts");
 
 describe.skipIf(!url)("timescaledb hypertables", () => {

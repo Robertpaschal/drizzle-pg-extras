@@ -5,10 +5,10 @@ import { fileURLToPath } from "node:url";
 import { sql } from "drizzle-orm";
 import { index, integer, pgEnum, pgTable, pgView, serial, text, unique } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
+import { KIT_BIN as kit } from "../kit-version.js";
 import { defineExtras, generate, pgExtension, pgFunction, pgTrigger, withComment } from "../../src/index.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.tmp");
-const kit = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../node_modules/drizzle-kit/bin.cjs");
 
 describe("drizzle-kit snapshot chain", () => {
   it("keeps the next drizzle-kit generate from repeating table DDL", () => {
