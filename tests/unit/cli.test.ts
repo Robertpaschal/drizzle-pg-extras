@@ -1,6 +1,8 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "tsup";
 import { describe, expect, it } from "vitest";
 import { run } from "../../src/cli.js";
 import { KIT_MAJOR } from "../kit-version.js";
@@ -8,6 +10,23 @@ import { KIT_MAJOR } from "../kit-version.js";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.tmp");
 
 describe("cli", () => {
+  it.skipIf(process.platform === "win32")("runs the built CLI through an npm-style symlink", async () => {
+    mkdirSync(root, { recursive: true });
+    const dir = mkdtempSync(path.join(root, "cli-bin-"));
+    try {
+      await build({ outDir: dir, dts: false, silent: true });
+
+      const bin = path.join(dir, "drizzle-pg-extras");
+      symlinkSync(path.join(dir, "cli.js"), bin, "file");
+      const result = spawnSync(process.execPath, [bin, "--help"], { encoding: "utf8" });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("drizzle-pg-extras generate | check");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("generates from a drizzle config and checks that a second run is clean", async () => {
     mkdirSync(root, { recursive: true });
     const dir = mkdtempSync(path.join(root, "cli-"));

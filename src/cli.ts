@@ -1,4 +1,3 @@
-import { pathToFileURL } from "node:url";
 import { pendingStatements, generate } from "./generate.js";
 import { PgExtrasError } from "./errors.js";
 import { loadProject } from "./load.js";
@@ -114,16 +113,4 @@ function printHelp(): void {
 
 function commandList(): string {
   return "generate | check";
-}
-
-const entry = process.argv[1];
-if (entry && import.meta.url === pathToFileURL(entry).href) {
-  run(process.argv.slice(2))
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error: unknown) => {
-      console.error(error);
-      process.exitCode = 1;
-    });
 }
