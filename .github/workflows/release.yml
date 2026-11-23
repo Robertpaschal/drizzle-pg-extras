@@ -1,0 +1,65 @@
+name: Release
+
+# Publishes to npm when a version tag (v1.2.3) is pushed, using npm trusted
+# publishing (OIDC). No npm token is stored anywhere: npm checks that the
+# publish comes from this repository and this workflow file.
+#
+# One-time setup on npmjs.com (package settings -> Trusted publisher):
+#   GitHub Actions, owner Robertpaschal, repository drizzle-pg-extras,
+#   workflow filename release.yml, no environment.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: extras
+          POSTGRES_PASSWORD: extras
+          POSTGRES_DB: drizzle_pg_extras
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U extras -d drizzle_pg_extras"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+      - run: npm install -g npm@^11.5.1
+      - name: Tag must match package.json version
+        run: |
+          pkg="v$(node -p "require('./package.json').version")"
+          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+        env:
+          POSTGRES_URL: postgres://extras:extras@localhost:5432/drizzle_pg_extras
+      # prepublishOnly runs the build. Provenance is attached automatically
+      # under trusted publishing; the flag keeps it explicit.
+      - run: npm publish --provenance --access public
