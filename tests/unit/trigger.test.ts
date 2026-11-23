@@ -420,4 +420,22 @@ describe("trigger rules", () => {
       function: fn,
     })).toThrow(/does not belong to view/);
   });
+
+  it("still sees OLD and NEW after E'...' escape-string literals in WHEN", () => {
+    // sunnatulla_dev (DEV comment, 2026-11-20): the scanner treated E'\'' as
+    // a doubled '' pair, so the string never closed and everything after it
+    // — including an OLD reference an INSERT trigger cannot use — was skipped.
+    const insertWithOld = (when: string) => () => pgTrigger("t", { ...base, events: ["insert"], when: sql.raw(when) });
+    expect(insertWithOld("NEW.note <> E'\\'' OR OLD.status IS NULL")).toThrow(/cannot reference OLD/);
+    expect(insertWithOld("NEW.note <> E'\\\\' OR OLD.status IS NULL")).toThrow(/cannot reference OLD/);
+    expect(insertWithOld("E'it\\'s' = NEW.note OR OLD.status IS NULL")).toThrow(/cannot reference OLD/);
+    expect(insertWithOld("NEW.note <> U&'\\'' OR OLD.status IS NULL")).toThrow(/cannot reference OLD/);
+    // Plain '' doubled-quote escapes still behave the same way.
+    expect(insertWithOld("NEW.note <> 'it''s' OR OLD.status IS NULL")).toThrow(/cannot reference OLD/);
+    // Keywords and references hidden inside an escape string stay hidden.
+    expect(() => pgTrigger("t", { ...base, events: ["insert"], when: sql.raw("NEW.note = E'OLD'") })).not.toThrow();
+    expect(() => pgTrigger("t", { ...base, events: ["insert"], when: sql.raw("NEW.note = E'SELECT'") })).not.toThrow();
+    // A valid escape-string literal on its own is accepted.
+    expect(() => pgTrigger("t", { ...base, when: sql.raw("NEW.note = E'\\''") })).not.toThrow();
+  });
 });

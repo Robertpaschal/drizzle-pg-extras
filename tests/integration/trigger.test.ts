@@ -4,13 +4,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
-import { migrationFile, migrationTags } from "../kit-version.js";
+import { KIT_BIN as kit, migrationFile, migrationTags } from "../kit-version.js";
 import { splitMigrationSql } from "../../src/index.js";
 import { run } from "../../src/cli.js";
 
 const url = process.env.POSTGRES_URL;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.tmp");
-const kit = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../node_modules/drizzle-kit/bin.cjs");
 const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../src/index.ts");
 
 function schemaSource(options: { initially: "deferred" | "immediate"; enabled: boolean }): string {
